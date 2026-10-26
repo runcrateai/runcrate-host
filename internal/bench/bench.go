@@ -90,14 +90,16 @@ func round(v float64) float64 { return float64(int64(v*10+0.5)) / 10 }
 
 // SpeedTest is where internet bandwidth is measured (outbound HTTPS only).
 type SpeedTest struct {
-	DownURL string // GET, returns at least the bytes asked for
+	DownURL string // GET, returns the bytes asked for; fetched downRounds times per stream
 	UpURL   string // POST sink
 	HTTP    *http.Client
 }
 
-// DefaultSpeedTest uses Cloudflare's public speed test endpoints.
+// DefaultSpeedTest uses Cloudflare's public speed test endpoints. They refuse
+// (403) a single download of 100 MB or more, so each stream asks for 50 MB a
+// few times over.
 var DefaultSpeedTest = SpeedTest{
-	DownURL: "https://speed.cloudflare.com/__down?bytes=200000000",
+	DownURL: "https://speed.cloudflare.com/__down?bytes=50000000",
 	UpURL:   "https://speed.cloudflare.com/__up",
 }
 
@@ -110,16 +112,15 @@ func (s SpeedTest) Net(ctx context.Context) api.NetBench {
 	var out api.NetBench
 	const streams = 4
 	down, err := parallel(streams, func() (int64, error) {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.DownURL, nil)
-		resp, err := c.Do(req)
-		if err != nil {
-			return 0, err
+		var total int64
+		for range downRounds {
+			n, err := s.download(ctx, c)
+			total += n
+			if err != nil {
+				return total, err
+			}
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return 0, fmt.Errorf("download: HTTP %d", resp.StatusCode)
-		}
-		return io.Copy(io.Discard, resp.Body)
+		return total, nil
 	})
 	if err != nil {
 		out.Error = err.Error()
@@ -145,6 +146,23 @@ func (s SpeedTest) Net(ctx context.Context) api.NetBench {
 	}
 	out.UpMbps = round(up)
 	return out
+}
+
+// downRounds is how many downloads each stream makes in a row: 4 streams of
+// 4 x 50 MB give a few seconds on a 1 Gbit/s link.
+const downRounds = 4
+
+func (s SpeedTest) download(ctx context.Context, c *http.Client) (int64, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.DownURL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	}
+	return io.Copy(io.Discard, resp.Body)
 }
 
 // parallel runs fn n times at once and returns the aggregate Mbit/s.

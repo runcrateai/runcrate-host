@@ -1147,7 +1147,11 @@ func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// Shrunk to fit a small host, as the capacity check counts the reserve.
 	vcpus, ram := 4, 16
+	if m.HostThreads > 0 && m.HostThreads-reserveThreads < vcpus {
+		vcpus = max(1, m.HostThreads-reserveThreads)
+	}
 	if m.HostRAMGB > 0 && m.HostRAMGB-reserveRAMGB < ram {
 		ram = max(4, m.HostRAMGB-reserveRAMGB)
 	}
