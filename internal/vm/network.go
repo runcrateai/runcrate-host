@@ -255,14 +255,14 @@ func (n *Network) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// FirewallChanges signals each nftables change on the host (`nft monitor`),
-// so a flush is repaired at once rather than on the next tick. Signals
-// coalesce; the channel closes when the monitor exits (call it again later).
+// FirewallChanges signals nftables changes on the host (`nft monitor`), so a
+// flush is repaired at once rather than on the next tick. Signals coalesce;
+// the channel closes when the monitor exits (call it again later).
 func FirewallChanges(ctx context.Context) <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	args := []string{"nft", "monitor"}
-	// nft's stdout is block-buffered on a pipe: line-buffer it, or a flush
-	// would only show up once 4 KB of events piled up.
+	// Line-buffer nft's stdout in case its build doesn't flush each event
+	// on a pipe.
 	if p, err := exec.LookPath("stdbuf"); err == nil {
 		args = append([]string{p, "-oL"}, args...)
 	}
@@ -281,6 +281,9 @@ func FirewallChanges(ctx context.Context) <-chan struct{} {
 		// A large set (a fail2ban or CrowdSec blocklist) prints long lines.
 		sc.Buffer(make([]byte, 64<<10), 16<<20)
 		for sc.Scan() {
+			if !firewallEvent(sc.Text()) {
+				continue
+			}
 			select {
 			case ch <- struct{}{}:
 			default:
@@ -290,6 +293,20 @@ func FirewallChanges(ctx context.Context) <-chan struct{} {
 		_ = cmd.Wait()
 	}()
 	return ch
+}
+
+// firewallEvent reports whether an `nft monitor` line may have changed our
+// firewall. Element updates in other tables' sets (a fail2ban or CrowdSec
+// blocklist churning) and generation comments don't; a flush shows up as
+// delete rule, chain, set and table lines.
+func firewallEvent(line string) bool {
+	if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "add element ") || strings.HasPrefix(line, "delete element ") {
+		return strings.Contains(line, " runcrate_host ")
+	}
+	return true
 }
 
 func (n *Network) taps() []string {
