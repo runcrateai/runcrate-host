@@ -89,7 +89,7 @@ Reported to Runcrate: GPU health, VM states, load, the benchmark results, and th
 
 Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runcrate-host console <vm id>` (a VM's serial console).
 
-The agent only uses a data directory carrying its marker, `.runcrate-host-data`: it takes a new or empty directory (a fresh filesystem's `lost+found` is fine) and refuses one holding other files. A host installed before the marker existed won't start the agent until you run the installer again (or `sudo runcrate-host register`), which adds the marker when the directory holds only the agent's own files and its state. If it still refuses (a host without the NVIDIA driver that never ran a VM), uninstall and install again. If the data directory is a separate disk, the agent also refuses to start while it isn't mounted.
+The agent only uses a data directory carrying its marker, `.runcrate-host-data`: it takes a new or empty directory (a fresh filesystem's `lost+found` is fine) and refuses one holding other files. A host installed before the marker existed won't start the agent until you run the installer again (or `sudo runcrate-host register`), which adds the marker when the directory holds only the agent's own files and its state. If it still refuses (a host without the NVIDIA driver that never ran a VM), uninstall, delete the data directory (it holds only the agent's files) and install again. If the data directory is a separate disk, the agent also refuses to start while it isn't mounted.
 
 ## Uninstall
 
