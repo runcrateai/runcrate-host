@@ -466,9 +466,11 @@ func parseNft(b []byte) []nftObject {
 	return out.Nftables
 }
 
-// iptablesTables are the tables iptables-nft owns; allowThroughIptables
-// covers those.
-var iptablesTables = map[string]bool{"filter": true, "nat": true, "mangle": true, "raw": true, "security": true}
+// iptablesChain reports whether a chain is iptables-nft's own built-in
+// INPUT or FORWARD, which allowThroughIptables covers.
+func iptablesChain(family, table, name string) bool {
+	return family == "ip" && table == "filter" && (name == "INPUT" || name == "FORWARD")
+}
 
 // dropChains lists other tables' IPv4 input and forward base chains whose
 // policy is drop (a partner's own nftables firewall): their drop applies to
@@ -480,7 +482,7 @@ func dropChains(listing []byte) [][3]string {
 		if c == nil || c.Policy != "drop" || foreignRules[c.Hook] == nil || c.Table == "runcrate_host" {
 			continue
 		}
-		if c.Family == "inet" || (c.Family == "ip" && !iptablesTables[c.Table]) {
+		if c.Family == "inet" || (c.Family == "ip" && !iptablesChain(c.Family, c.Table, c.Name)) {
 			out = append(out, [3]string{c.Family, c.Table, c.Name})
 		}
 	}
