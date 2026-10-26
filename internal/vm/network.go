@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -235,7 +236,8 @@ func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(
 // Reconcile re-applies the firewall when someone flushed or changed it (a
 // partner's `systemctl restart nftables` runs `flush ruleset`) or when the
 // host's networks changed. If it can't, every VM is cut off the network
-// until it can. Call it every few seconds.
+// until it can. Call it on every FirewallChanges signal and every few
+// seconds.
 func (n *Network) Reconcile(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -251,6 +253,41 @@ func (n *Network) Reconcile(ctx context.Context) error {
 	}
 	n.restoreVMs(ctx)
 	return nil
+}
+
+// FirewallChanges signals each nftables change on the host (`nft monitor`),
+// so a flush is repaired at once rather than on the next tick. Signals
+// coalesce; the channel closes when the monitor exits (call it again later).
+func FirewallChanges(ctx context.Context) <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	args := []string{"nft", "monitor"}
+	// nft's stdout is block-buffered on a pipe: line-buffer it, or a flush
+	// would only show up once 4 KB of events piled up.
+	if p, err := exec.LookPath("stdbuf"); err == nil {
+		args = append([]string{p, "-oL"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	out, err := cmd.StdoutPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		close(ch)
+		return ch
+	}
+	go func() {
+		defer close(ch)
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+		_ = cmd.Process.Kill() // a scan error leaves it blocked on the pipe
+		_ = cmd.Wait()
+	}()
+	return ch
 }
 
 func (n *Network) taps() []string {

@@ -209,7 +209,9 @@ func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
 	}
 	defer os.Remove(tmp.Name())
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, MaxImageBytes+1))
+	// A chunked answer has no length to check up front: keep checking the
+	// disk while it writes.
+	n, err := io.Copy(io.MultiWriter(&diskGuard{w: tmp, dir: s.Dir, pending: diskGuardEvery}, h), io.LimitReader(resp.Body, MaxImageBytes+1))
 	if err == nil && n > MaxImageBytes {
 		err = fmt.Errorf("over the %d byte limit", int64(MaxImageBytes))
 	}
@@ -258,4 +260,25 @@ func (s *ImageStore) selfContained(ctx context.Context, p string) error {
 		return fmt.Errorf("image must be a self-contained qcow2 (format %q, backing %q, data file %q)", info.Format, info.Backing, info.Spec.Data.DataFile)
 	}
 	return nil
+}
+
+// diskGuardEvery is how often (in bytes written) diskGuard checks the disk.
+const diskGuardEvery = 256 << 20
+
+// diskGuard fails a write once the filesystem holding dir has less than the
+// host reserve free.
+type diskGuard struct {
+	w       io.Writer
+	dir     string
+	pending int64
+}
+
+func (g *diskGuard) Write(p []byte) (int, error) {
+	if g.pending += int64(len(p)); g.pending >= diskGuardEvery {
+		g.pending = 0
+		if free, _ := hw.DiskFree(g.dir); free > 0 && free < uint64(ReserveDiskGB)<<30 {
+			return 0, fmt.Errorf("disk nearly full (%d bytes free, %d GB kept for the host)", free, ReserveDiskGB)
+		}
+	}
+	return g.w.Write(p)
 }

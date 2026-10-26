@@ -88,10 +88,8 @@ func main() {
 	case "uninstall-runtime":
 		err = cmdUninstallRuntime(ctx, dir, log)
 	case "cut-network":
-		err = withConfig(dir, func(cfg *config.Config) error {
-			_, subnet, _ := net.ParseCIDR(cfg.VMSubnet)
-			return (&vm.Network{Subnet: subnet, Run: sysexec.Exec{}, ProcRoot: "/"}).CutTaps(ctx)
-		})
+		// No config: a broken config.json must not keep the VMs online.
+		err = (&vm.Network{Run: sysexec.Exec{}}).CutTaps(ctx)
 	case "console":
 		if len(os.Args) != 3 {
 			err = errors.New("usage: runcrate-host console <vm id>")
@@ -471,17 +469,28 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 		metaErr <- rt.meta.Serve(mgrCtx, fmt.Sprintf("0.0.0.0:%d", vm.MetadataPort))
 	}()
 	// Keep the firewall in place: a partner restarting nftables flushes it.
+	// nft monitor repairs that at once; the ticker covers a monitor that
+	// died (and restarts it) and host network changes.
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
+		changes := vm.FirewallChanges(mgrCtx)
 		for {
 			select {
 			case <-mgrCtx.Done():
 				return
-			case <-t.C:
-				if err := rt.net.Reconcile(mgrCtx); err != nil {
-					log.Error("firewall", "err", err)
+			case _, ok := <-changes:
+				if !ok {
+					changes = nil
+					continue
 				}
+			case <-t.C:
+				if changes == nil {
+					changes = vm.FirewallChanges(mgrCtx)
+				}
+			}
+			if err := rt.net.Reconcile(mgrCtx); err != nil {
+				log.Error("firewall", "err", err)
 			}
 		}
 	}()
