@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -228,6 +229,7 @@ func (n *Network) apply(ctx context.Context) error {
 	}
 	n.applied, n.partner = digest(out), partner
 	n.allowThroughIptables(ctx)
+	n.allowThroughForeignNft(ctx)
 	return nil
 }
 
@@ -245,6 +247,7 @@ func (n *Network) Reconcile(ctx context.Context) error {
 	partner := n.partnerNets()
 	if err == nil && digest(out) == n.applied && strings.Join(partner, ",") == strings.Join(n.partner, ",") {
 		n.allowThroughIptables(ctx)
+		n.allowThroughForeignNft(ctx)
 		return nil
 	}
 	if err := n.apply(ctx); err != nil {
@@ -421,6 +424,7 @@ func (n *Network) Teardown(ctx context.Context) {
 		_ = n.sysctl("net.ipv4.ip_forward", "0")
 	}
 	_, _ = n.Run.Run(ctx, "nft", "delete", "table", "inet", "runcrate_host")
+	n.removeForeignNft(ctx)
 	for chain, rules := range iptablesRules {
 		for _, rule := range rules {
 			for {
@@ -428,6 +432,109 @@ func (n *Network) Teardown(ctx context.Context) {
 					break
 				}
 			}
+		}
+	}
+}
+
+// foreignTag marks the rules allowThroughForeignNft puts in other tables.
+const foreignTag = "runcrate-host"
+
+// foreignRules, by hook: the same narrow accepts as iptablesRules. Ours runs
+// first (priority filter - 10) and has already dropped everything else from
+// rc-*.
+var foreignRules = map[string][]string{
+	"input":   {fmt.Sprintf(`iifname "rc-*" tcp dport %d accept`, MetadataPort)},
+	"forward": {`iifname "rc-*" accept`, `oifname "rc-*" ct state established,related accept`},
+}
+
+// nftObject is one entry of `nft -j list ...`.
+type nftObject struct {
+	Chain *struct {
+		Family, Table, Name, Hook, Policy string
+	} `json:"chain"`
+	Rule *struct {
+		Family, Table, Chain, Comment string
+		Handle                        int
+	} `json:"rule"`
+}
+
+func parseNft(b []byte) []nftObject {
+	var out struct {
+		Nftables []nftObject `json:"nftables"`
+	}
+	_ = json.Unmarshal(b, &out)
+	return out.Nftables
+}
+
+// iptablesTables are the tables iptables-nft owns; allowThroughIptables
+// covers those.
+var iptablesTables = map[string]bool{"filter": true, "nat": true, "mangle": true, "raw": true, "security": true}
+
+// dropChains lists other tables' IPv4 input and forward base chains whose
+// policy is drop (a partner's own nftables firewall): their drop applies to
+// our VMs' traffic too, whatever our table accepts.
+func dropChains(listing []byte) [][3]string {
+	var out [][3]string
+	for _, o := range parseNft(listing) {
+		c := o.Chain
+		if c == nil || c.Policy != "drop" || foreignRules[c.Hook] == nil || c.Table == "runcrate_host" {
+			continue
+		}
+		if c.Family == "inet" || (c.Family == "ip" && !iptablesTables[c.Table]) {
+			out = append(out, [3]string{c.Family, c.Table, c.Name})
+		}
+	}
+	return out
+}
+
+// allowThroughForeignNft puts foreignRules at the top of every chain
+// dropChains finds, once (tagged). Re-checked on every reconcile, since the
+// partner reloading their firewall removes them.
+func (n *Network) allowThroughForeignNft(ctx context.Context) {
+	listing, err := n.Run.Run(ctx, "nft", "-j", "list", "chains")
+	if err != nil {
+		return
+	}
+	for _, c := range dropChains(listing) {
+		out, err := n.Run.Run(ctx, "nft", "-j", "list", "chain", c[0], c[1], c[2])
+		if err != nil {
+			continue
+		}
+		var hook string
+		var tagged []int
+		for _, o := range parseNft(out) {
+			if o.Chain != nil {
+				hook = o.Chain.Hook
+			}
+			if o.Rule != nil && o.Rule.Comment == foreignTag {
+				tagged = append(tagged, o.Rule.Handle)
+			}
+		}
+		want := foreignRules[hook]
+		if len(tagged) == len(want) {
+			continue
+		}
+		var script strings.Builder
+		for _, h := range tagged {
+			fmt.Fprintf(&script, "delete rule %s %s %s handle %d\n", c[0], c[1], c[2], h)
+		}
+		// Inserted last first, so they end up in order at the top.
+		for i := len(want) - 1; i >= 0; i-- {
+			fmt.Fprintf(&script, "insert rule %s %s %s %s comment %q\n", c[0], c[1], c[2], want[i], foreignTag)
+		}
+		_, _ = n.Run.RunInput(ctx, []byte(script.String()), "nft", "-f", "-")
+	}
+}
+
+// removeForeignNft deletes every rule allowThroughForeignNft added.
+func (n *Network) removeForeignNft(ctx context.Context) {
+	listing, err := n.Run.Run(ctx, "nft", "-j", "list", "ruleset")
+	if err != nil {
+		return
+	}
+	for _, o := range parseNft(listing) {
+		if r := o.Rule; r != nil && r.Comment == foreignTag && r.Table != "runcrate_host" {
+			_, _ = n.Run.Run(ctx, "nft", "delete", "rule", r.Family, r.Table, r.Chain, "handle", strconv.Itoa(r.Handle))
 		}
 	}
 }
