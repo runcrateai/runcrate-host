@@ -378,6 +378,12 @@ func TestLoadResumesRunningAndDropsHalfMade(t *testing.T) {
 	if err := f.m.save(half); err != nil {
 		t.Fatal(err)
 	}
+	// The VM's own directory belongs to its QEMU: a record planted there
+	// (asking to tear down the host's bridge) must not be what Load trusts.
+	forged := `{"id":"vm-run","tap":"br0","want":false,"state":"running"}`
+	if err := os.WriteFile(filepath.Join(f.m.dir("vm-run"), "vm.json"), []byte(forged), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	// Host reboot: no units, fresh manager.
 	host := &fakeHost{units: map[string]string{}}
 	m2 := &Manager{

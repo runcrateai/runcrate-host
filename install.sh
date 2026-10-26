@@ -65,6 +65,7 @@ Runcrate host installer
   --binary PATH   install this runcrate-host binary instead of downloading it (testing only:
                   it is not signature-checked)
   --api URL       host API (testing only)
+  --force         go on past the OS, bare-metal and IOMMU checks (testing only)
 EOF
 }
 
@@ -168,10 +169,14 @@ uninstall() {
 		say "Left $data in place: it holds files runcrate-host didn't create."
 	fi
 	rm -rf "$CONF_DIR"
-	rm -f "$BIN" "$BIN.prev"
-	if id "$VM_USER" >/dev/null 2>&1; then
-		userdel "$VM_USER" >/dev/null 2>&1 || say "Could not remove the $VM_USER user (still in use?)."
-	fi
+	rm -f "$BIN" "$BIN.prev" "$BIN.new"
+	# The agent adds one QEMU user per VM slot (runcrate-vm-<n>, group runcrate-vm).
+	for u in $(getent passwd | cut -d: -f1 | grep -E "^$VM_USER-[0-9]+\$" || true) "$VM_USER"; do
+		if id "$u" >/dev/null 2>&1; then
+			userdel "$u" >/dev/null 2>&1 || say "Could not remove the $u user (still in use?)."
+		fi
+	done
+	if getent group "$VM_USER" >/dev/null 2>&1; then groupdel "$VM_USER" >/dev/null 2>&1 || true; fi
 	step "Done"
 	say "runcrate-host is removed and every GPU is back with the host. The GPUs reach your own"
 	say "driver now (or after a reboot if nothing was loaded). Packages it installed (qemu, ovmf,"
@@ -205,6 +210,10 @@ check_iommu() {
 	step "Checking IOMMU"
 	if [ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
 		say "IOMMU is on."
+		return 0
+	fi
+	if [ "$FORCE" -eq 1 ]; then
+		say "IOMMU is off; continuing anyway (--force). No GPU can be passed through until it is on."
 		return 0
 	fi
 	if grep -q GenuineIntel /proc/cpuinfo; then param="intel_iommu=on iommu=pt"; else param="amd_iommu=on iommu=pt"; fi
@@ -296,6 +305,7 @@ verify_release() {
 
 install_agent() {
 	step "Installing the agent"
+	v=""
 	if [ -n "$BINARY" ]; then
 		cp "$BINARY" "$tmp/runcrate-host"
 		say "Using $BINARY (not signature-checked: --binary is for testing)."
@@ -308,11 +318,15 @@ install_agent() {
 		mv "$tmp/$ASSET" "$tmp/runcrate-host"
 		mv "$tmp/$ASSET.sig" "$tmp/runcrate-host.sig"
 		verify_release "$tmp/runcrate-host" "$v" || die "the downloaded agent is not signed by Runcrate; nothing was installed"
-		chmod 0755 "$tmp/runcrate-host"
-		[ "$("$tmp/runcrate-host" version)" = "$v" ] || die "the downloaded agent does not report version $v"
 		say "Signature OK (runcrate-host $v)."
 	fi
-	install -m 0755 "$tmp/runcrate-host" "$BIN"
+	# Run it from its final directory (/tmp may be noexec), then swap it in.
+	install -m 0755 "$tmp/runcrate-host" "$BIN.new"
+	if [ -n "${v:-}" ] && [ "$("$BIN.new" version 2>/dev/null)" != "$v" ]; then
+		rm -f "$BIN.new"
+		die "the downloaded agent does not report version $v; nothing was installed"
+	fi
+	mv -f "$BIN.new" "$BIN"
 	mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
 	say "runcrate-host $("$BIN" version)"
 }

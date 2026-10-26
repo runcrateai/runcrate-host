@@ -24,7 +24,7 @@ Every step checks before it changes anything, so running it again is safe.
 
 1. Checks the OS, CPU virtualization, the GPUs and the IOMMU.
 2. Installs QEMU/KVM, OVMF, nftables, genisoimage and iperf3 (and perftest when InfiniBand is present).
-3. Creates the unprivileged `runcrate-vm` user that QEMU runs as (group `kvm`), with a udev rule giving group `kvm` access to `/dev/vhost-net`.
+3. Creates the unprivileged `runcrate-vm` user and group, with a udev rule giving group `kvm` access to `/dev/vhost-net`. Each VM's QEMU runs confined as its own user (`runcrate-vm-<slot>`, group `runcrate-vm`, in `kvm`), which the agent adds on first use, so one VM can't reach another's disk, sockets or process.
 4. Downloads the agent, checks its ed25519 signature against Runcrate's release key with `openssl` (it refuses to install anything unsigned), and installs it at `/usr/local/bin/runcrate-host`.
 5. Takes the GPUs off the host: stops `nvidia-persistenced` and `nvidia-fabricmanager` if they run, and moves each GPU (and the other functions of its card, such as HDMI audio) to `vfio-pci`. When Runcrate gets every GPU, a modprobe rule also claims them at boot before any host driver.
 6. Registers the machine with your token. The host credential it gets back is stored in `/etc/runcrate-host/credential`, readable by root only.
@@ -84,7 +84,7 @@ Reported to Runcrate: GPU health, VM states, load, the benchmark results, and th
 | `/etc/systemd/system/runcrate-host.service`, `runcrate-host-gpus.service` | services |
 | `/etc/modprobe.d/runcrate-host-vfio.conf`, `/etc/modules-load.d/runcrate-host.conf` | GPU binding at boot |
 | `/etc/udev/rules.d/90-runcrate-host.rules` | `/dev/vhost-net` for group `kvm` |
-| user `runcrate-vm` | runs QEMU, unprivileged |
+| users `runcrate-vm`, `runcrate-vm-<slot>` | run QEMU, unprivileged, one user per VM slot |
 | `/etc/default/grub.d/90-runcrate-host.cfg` | only if the installer turned on the IOMMU |
 
 Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runcrate-host console <vm id>` (a VM's serial console).
@@ -95,7 +95,7 @@ Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runc
 curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall
 ```
 
-This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot and udev rules and the IOMMU GRUB line it added, the `runcrate-vm` user, the agent and its config. In the data directory it deletes only what the agent created (`vms/`, `images/`, `holds/`, `state.json`, `gpus-cache.json`), and the directory itself only if that leaves it empty. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
+This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot and udev rules and the IOMMU GRUB line it added, the `runcrate-vm` users and group, the agent and its config. In the data directory it deletes only what the agent created (`vms/`, `images/`, `holds/`, `state.json`, `gpus-cache.json`), and the directory itself only if that leaves it empty. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
 
 ## Development
 
@@ -105,6 +105,7 @@ make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 an
 RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
   go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64   # .sig
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
+RUNCRATE_HOST_SIGNING_KEY=... go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
 ```
 
 The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cudart, cuBLAS), Fabric Manager and `rc-gpubench`. Everything a customer machine needs beyond that comes from its setup script at first boot.

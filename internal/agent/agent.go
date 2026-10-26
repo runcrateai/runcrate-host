@@ -137,7 +137,6 @@ func (a *Agent) Run(ctx context.Context) error {
 			backoff = min(time.Minute, a.unauthorizedGrace())
 		case err != nil:
 			rejectedSince = time.Time{}
-		case err != nil:
 			a.Log.Warn("heartbeat failed", "err", err)
 			// Back off on errors, never slower than the max interval.
 			backoff = min(backoff*2, MaxInterval)

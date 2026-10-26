@@ -399,7 +399,7 @@ func buildRuntime(cfg *config.Config, log *slog.Logger, cred string) (*runtime, 
 	_, _, threads := hw.Host.CPU()
 	total, _ := hw.Host.Mem()
 	run := sysexec.Exec{}
-	n := &vm.Network{Subnet: subnet, ForwardWasOff: cfg.ForwardWasOff, Run: run, ProcRoot: "/"}
+	n := &vm.Network{Subnet: subnet, ForwardWasOff: cfg.ForwardWasOff, Blocked: cfg.BlockedCIDRs, Run: run, ProcRoot: "/"}
 	meta := metadata.New(subnet)
 	mgr := &vm.Manager{
 		DataDir: cfg.DataDir, Net: n, Meta: meta, Run: run, Sys: hw.Host, VFIO: vfio.Sysfs{Root: "/"},
@@ -563,7 +563,10 @@ func cmdStatus(ctx context.Context, dir string) error {
 	ents, _ := os.ReadDir(filepath.Join(cfg.DataDir, "vms"))
 	fmt.Println("VMs:")
 	for _, e := range ents {
-		b, err := os.ReadFile(filepath.Join(cfg.DataDir, "vms", e.Name(), "vm.json"))
+		if !strings.HasPrefix(e.Name(), ".rec-") || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(cfg.DataDir, "vms", e.Name()))
 		if err != nil {
 			continue
 		}
@@ -591,17 +594,14 @@ func cmdUninstallRuntime(ctx context.Context, dir string, log *slog.Logger) erro
 	}
 	_, subnet, _ := net.ParseCIDR(cfg.VMSubnet)
 	run := sysexec.Exec{}
-	n := &vm.Network{Subnet: subnet, ForwardWasOff: cfg.ForwardWasOff, Run: run, ProcRoot: "/"}
+	n := &vm.Network{Subnet: subnet, ForwardWasOff: cfg.ForwardWasOff, Blocked: cfg.BlockedCIDRs, Run: run, ProcRoot: "/"}
 	mgr := &vm.Manager{DataDir: cfg.DataDir, Net: n, Meta: metadata.New(subnet), Run: run, Sys: hw.Host, VFIO: vfio.Sysfs{Root: "/"}, Log: log}
-	ents, _ := os.ReadDir(filepath.Join(cfg.DataDir, "vms"))
 	if err := mgr.Load(ctx, false); err != nil {
 		log.Warn("load vms", "err", err)
 	}
-	for _, e := range ents {
-		if vm.ValidID(e.Name()) {
-			if err := mgr.Destroy(ctx, e.Name()); err != nil {
-				log.Error("destroy", "vm", e.Name(), "err", err)
-			}
+	for _, id := range mgr.IDs() {
+		if err := mgr.Destroy(ctx, id); err != nil {
+			log.Error("destroy", "vm", id, "err", err)
 		}
 	}
 	mgr.Wait()

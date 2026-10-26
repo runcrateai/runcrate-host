@@ -5,7 +5,10 @@
 #
 #   sudo image/build.sh [version]         (Ubuntu/Debian x86_64 with KVM; no GPU needed)
 #
-# Writes out/runcrate-vm-<version>.qcow2 and its .sha256.
+# Writes out/runcrate-vm-<version>.qcow2 and its .sha256. The agent only takes
+# a signed image: sign it (kind runcrate-vm) and upload the .sig next to it:
+#   RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
+#     go run ./hack/sign -kind runcrate-vm -version <version> out/runcrate-vm-<version>.qcow2
 #   DRIVER_BRANCH=580   pin the driver branch (default: newest nvidia-open)
 #   CUDA_VERSION=12-9   pin CUDA (default: newest)
 set -eu
@@ -98,7 +101,10 @@ write_files:
       dpkg -i /tmp/cuda-keyring.deb
       apt-get update
       if [ -n "$DRIVER_BRANCH" ]; then apt-get install -y nvidia-open-$DRIVER_BRANCH; else apt-get install -y nvidia-open; fi
-      dver=\$( (dpkg-query -W -f='\${Version}\n' nvidia-kernel-open-dkms nvidia-kernel-source-open 2>/dev/null || true) | grep -m1 . | sed 's/^[0-9]*://; s/-.*//' || true)
+      # The open kernel module source package is nvidia-kernel-source-open
+      # (590 and later) or nvidia-kernel-source-<branch>-open / nvidia-dkms-<branch>-open
+      # (570 to 580); take whichever is installed.
+      dver=\$( (dpkg-query -W -f='\${db:Status-Abbrev} \${Version}\n' 'nvidia-kernel-source-*open' 'nvidia-kernel-open-dkms' 'nvidia-dkms-*-open' 2>/dev/null || true) | awk '\$1 == "ii" {print \$2; exit}' | sed 's/^[0-9]*://; s/-.*//')
       [ -n "\$dver" ] || { echo "driver version not found"; exit 1; }
       echo "driver \$dver"
       # Fabric Manager must match the driver exactly or it refuses to start.
@@ -159,7 +165,9 @@ EOF
 printf 'instance-id: runcrate-image-build\nlocal-hostname: runcrate-image\n' > "$work/seed/meta-data"
 genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock "$work/seed/user-data" "$work/seed/meta-data"
 
-timeout 90m qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp "$(nproc)" -m 8G -nodefaults -display none \
+smp=$(nproc)
+[ "$smp" -le 16 ] || smp=16
+timeout 90m qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp "$smp" -m 8G -nodefaults -display none \
 	-drive file="$work/build.qcow2",if=virtio,format=qcow2,discard=unmap \
 	-drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \

@@ -87,7 +87,9 @@ type Spec struct {
 	Owner string `json:"owner,omitempty"`
 }
 
-// Record is a VM's persisted state (vm.json).
+// Record is a VM's persisted state (vms/.rec-<id>.json). It lives in the
+// root-owned vms directory, not the VM's own directory, which belongs to the
+// VM's QEMU user: an escaped QEMU can't rewrite what the agent trusts.
 type Record struct {
 	Spec
 	Slot        int       `json:"slot"`
@@ -141,7 +143,9 @@ type Manager struct {
 	BootWait time.Duration
 	// NoPassthrough (devmode only) boots VMs without their GPUs.
 	NoPassthrough bool
-	// QemuUser runs QEMU unprivileged and confined ("" only in tests).
+	// QemuUser names QEMU's group; each VM slot runs QEMU confined as its own
+	// user QemuUser-<slot> in that group, so VMs can't touch each other's
+	// files, sockets or processes ("" only in tests).
 	QemuUser string
 	// Ctx bounds background scrubs; cancel it at shutdown.
 	Ctx context.Context
@@ -150,6 +154,7 @@ type Manager struct {
 	vms     map[string]*Record
 	busy    map[int]string // gpu index -> vm id, or "scrub:<vm id>"
 	scrubOK map[int]bool   // false after a failed scrub: GPU held back
+	scrubs  map[string]bool // vm ids whose scrub was started in this run
 	wg      sync.WaitGroup
 }
 
@@ -158,6 +163,7 @@ func (m *Manager) init() {
 		m.vms = map[string]*Record{}
 		m.busy = map[int]string{}
 		m.scrubOK = map[int]bool{}
+		m.scrubs = map[string]bool{}
 	}
 	if m.BootWait == 0 {
 		m.BootWait = 5 * time.Second
@@ -182,7 +188,11 @@ func (m *Manager) save(r *Record) error {
 	if err != nil {
 		return err
 	}
-	return config.WriteFileAtomic(filepath.Join(m.dir(r.ID), "vm.json"), b, 0o600)
+	return config.WriteFileAtomic(m.recPath(r.ID), b, 0o600)
+}
+
+func (m *Manager) recPath(id string) string {
+	return filepath.Join(m.DataDir, "vms", ".rec-"+id+".json")
 }
 
 // Load reads persisted VMs. With resume, the host is brought back to them:
@@ -239,12 +249,20 @@ func (m *Manager) Load(ctx context.Context, resume bool) error {
 			go func() { defer m.wg.Done(); m.wipeDir(p) }()
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(m.dir(e.Name()), "vm.json"))
+		id, ok := strings.CutPrefix(e.Name(), ".rec-")
+		if !ok {
+			continue
+		}
+		id, ok = strings.CutSuffix(id, ".json")
+		if !ok || !ValidID(id) {
+			continue
+		}
+		b, err := os.ReadFile(m.recPath(id))
 		if err != nil {
 			continue
 		}
 		var r Record
-		if json.Unmarshal(b, &r) != nil || r.ID != e.Name() || !ValidID(r.ID) {
+		if json.Unmarshal(b, &r) != nil || r.ID != id {
 			continue
 		}
 		m.mu.Lock()
@@ -273,6 +291,9 @@ func (m *Manager) Load(ctx context.Context, resume bool) error {
 		}
 	}
 	for _, p := range scrubs {
+		if m.scrubStarted(p.id) {
+			continue // finishing its destroy above already started it
+		}
 		m.startScrub(p.id, p.gpus)
 	}
 	return nil
@@ -304,6 +325,18 @@ func (m *Manager) setState(r *Record, state, msg string) {
 
 // List reports customer VMs for the heartbeat, refreshing each one's state
 // from systemd.
+// IDs lists every loaded VM, throwaway ones included.
+func (m *Manager) IDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.vms))
+	for id := range m.vms {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (m *Manager) List(ctx context.Context) []api.VMStatus {
 	m.mu.Lock()
 	m.init()
@@ -362,7 +395,7 @@ func (m *Manager) FreeGPUs(withHeld bool) []int {
 	m.init()
 	var out []int
 	for _, g := range m.GPUs {
-		if _, busy := m.busy[g.Index]; busy || g.Blocker != "" {
+		if _, busy := m.busy[g.Index]; busy || (g.Blocker != "" && !m.NoPassthrough) {
 			continue
 		}
 		if ok, seen := m.scrubOK[g.Index]; seen && !ok && !withHeld {
@@ -615,7 +648,14 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 		m.Meta.Set(r.GuestIP, &metadata.Entry{VMID: r.ID, Ephemeral: r.Ephemeral, Reclaim: r.Reclaim})
 		return nil
 	}
-	if err := m.Net.AddTap(ctx, r.Tap, r.Slot, m.QemuUser); err != nil {
+	tapUser := ""
+	if m.QemuUser != "" {
+		if _, _, err := m.qemuIdentity(ctx, r.Slot); err != nil {
+			return err
+		}
+		tapUser = m.qemuUser(r.Slot)
+	}
+	if err := m.Net.AddTap(ctx, r.Tap, r.Slot, tapUser); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
 	m.Meta.Set(r.GuestIP, &metadata.Entry{VMID: r.ID, Ephemeral: r.Ephemeral, Reclaim: r.Reclaim})
@@ -641,7 +681,7 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 	if err != nil {
 		return err
 	}
-	if err := m.giveToQemu(r, groups); err != nil {
+	if err := m.giveToQemu(ctx, r, groups); err != nil {
 		return err
 	}
 	_, _ = m.Run.Run(ctx, "systemctl", "reset-failed", unit(r.ID))
@@ -660,7 +700,7 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 		"--property=KillMode=mixed", "--property=TimeoutStopSec=30", "--property=LimitMEMLOCK=infinity",
 		"--property=Restart=no", "--property=LimitCORE=0",
 	}
-	args = append(args, m.confinement(dir, groups)...)
+	args = append(args, m.confinement(m.qemuUser(r.Slot), dir, groups)...)
 	args = append(args, "--", "qemu-system-x86_64")
 	m.mu.Lock()
 	r.Started = true
@@ -707,22 +747,22 @@ func (m *Manager) groupDevices(addrs []string) ([]string, error) {
 
 // giveToQemu hands the VM's files and VFIO groups to the unprivileged QEMU
 // user.
-func (m *Manager) giveToQemu(r *Record, groups []string) error {
+func (m *Manager) giveToQemu(ctx context.Context, r *Record, groups []string) error {
 	if m.QemuUser == "" {
 		return nil
 	}
-	u, err := user.Lookup(m.QemuUser)
+	uid, gid, err := m.qemuIdentity(ctx, r.Slot)
 	if err != nil {
-		return fmt.Errorf("qemu user: %w", err)
+		return err
 	}
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
 	dir := m.dir(r.ID)
-	if err := os.Chown(dir, uid, gid); err != nil {
+	if err := lchownKind(dir, uid, gid, true); err != nil {
 		return err
 	}
 	for _, f := range []string{"disk.qcow2", "OVMF_VARS.fd", "seed.iso"} {
-		if err := os.Chown(filepath.Join(dir, f), uid, gid); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Lchown, and only regular files: after a restart these may have
+		// been replaced by the VM's QEMU, which owns the directory.
+		if err := lchownKind(filepath.Join(dir, f), uid, gid, false); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -732,6 +772,44 @@ func (m *Manager) giveToQemu(r *Record, groups []string) error {
 		}
 	}
 	return nil
+}
+
+// qemuUser is the user QEMU runs as in a slot.
+func (m *Manager) qemuUser(slot int) string { return m.QemuUser + "-" + strconv.Itoa(slot) }
+
+// qemuIdentity returns (creating it on first use) the slot's QEMU user: a
+// system user with no home or shell, primary group QemuUser, in group kvm.
+func (m *Manager) qemuIdentity(ctx context.Context, slot int) (uid, gid int, err error) {
+	name := m.qemuUser(slot)
+	u, err := user.Lookup(name)
+	if err != nil {
+		if _, err := m.Run.Run(ctx, "useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent",
+			"--shell", "/usr/sbin/nologin", "--gid", m.QemuUser, "--groups", "kvm", name); err != nil {
+			return 0, 0, fmt.Errorf("qemu user %s: %w", name, err)
+		}
+		if u, err = user.Lookup(name); err != nil {
+			return 0, 0, fmt.Errorf("qemu user %s: %w", name, err)
+		}
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	if err != nil || uid == 0 {
+		return 0, 0, fmt.Errorf("qemu user %s has uid %q", name, u.Uid)
+	}
+	gid, _ = strconv.Atoi(u.Gid)
+	return uid, gid, nil
+}
+
+// lchownKind changes the owner of a path that must be a directory (dir) or
+// a regular file, never following a symlink.
+func lchownKind(p string, uid, gid int, dir bool) error {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if (dir && !fi.IsDir()) || (!dir && !fi.Mode().IsRegular()) {
+		return fmt.Errorf("%s is not a plain %s", p, map[bool]string{true: "directory", false: "file"}[dir])
+	}
+	return os.Lchown(p, uid, gid)
 }
 
 // takeBack returns VFIO groups to root once a VM is gone.
@@ -744,12 +822,13 @@ func (m *Manager) takeBack(groups []string) {
 // confinement is the systemd sandbox for an unprivileged QEMU: no
 // capabilities, a read-only system, only its own directory writable, and
 // only the devices a VM needs.
-func (m *Manager) confinement(dir string, groups []string) []string {
+func (m *Manager) confinement(user, dir string, groups []string) []string {
 	if m.QemuUser == "" {
 		return nil
 	}
 	p := []string{
-		"--uid=" + m.QemuUser, "--gid=" + m.QemuUser,
+		"--uid=" + user, "--gid=" + m.QemuUser,
+		"--property=ProtectProc=invisible",
 		"--property=SupplementaryGroups=kvm",
 		"--property=NoNewPrivileges=yes",
 		"--property=CapabilityBoundingSet=",
@@ -874,6 +953,9 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("move disk aside: %w", err)
 	}
 	m.wipeDir(wipe)
+	if err := os.Remove(m.recPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.Log.Error("remove vm record", "vm", id, "err", err)
+	}
 	m.mu.Lock()
 	delete(m.vms, id)
 	for _, g := range gpus {
@@ -893,6 +975,12 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
+func (m *Manager) scrubStarted(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.scrubs[id]
+}
+
 func (m *Manager) scrubMarker(id string) string {
 	return filepath.Join(m.DataDir, "vms", ".scrub-"+id)
 }
@@ -901,6 +989,10 @@ func (m *Manager) scrubMarker(id string) string {
 // agent cancels at shutdown: a cancelled scrub keeps its marker and resumes
 // after the restart.
 func (m *Manager) startScrub(id string, gpus []int) {
+	m.mu.Lock()
+	m.init()
+	m.scrubs[id] = true
+	m.mu.Unlock()
 	ctx := m.Ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -1087,7 +1179,7 @@ func (m *Manager) wipeDir(dir string) {
 }
 
 func zeroFile(p string) error {
-	f, err := os.OpenFile(p, os.O_WRONLY, 0)
+	f, err := os.OpenFile(p, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
