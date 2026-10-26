@@ -18,6 +18,9 @@ func TestRegisterAlreadyRegisteredClaimsDataDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(data, "vms"), 0o711); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(data, gpuCacheFile), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := config.Load(dir)
 	if err != nil {
 		t.Fatal(err)

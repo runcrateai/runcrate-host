@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
@@ -167,11 +169,12 @@ func (c *Config) SaveCredential(cred string) error {
 // never touch a partner's files that happen to live there.
 const DataMarker = ".runcrate-host-data"
 
-// ClaimDataDir makes dir runcrate-host's data directory: it must be new,
-// empty (a fresh filesystem's lost+found aside), hold only what the agent
-// itself creates (an install from before the marker), or already carry the
-// marker.
-func ClaimDataDir(dir string) error {
+// ClaimDataDir makes dir runcrate-host's data directory. A fresh claim takes
+// only a new or empty directory (a fresh filesystem's lost+found aside).
+// With migrate (a host whose config already registered this dir, from
+// before the marker existed), it also takes a directory that holds only
+// what the agent itself creates, shaped the way the agent makes it.
+func ClaimDataDir(dir string, migrate bool) error {
 	marker := filepath.Join(dir, DataMarker)
 	if _, err := os.Lstat(marker); err == nil {
 		return nil
@@ -180,10 +183,22 @@ func ClaimDataDir(dir string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	ours, others := false, false
 	for _, e := range ents {
-		if !agentEntries[e.Name()] {
-			return fmt.Errorf("data directory %s already has files in it (%s): give runcrate-host a new or empty directory (--data-dir)", dir, e.Name())
+		name := e.Name()
+		if name == "lost+found" && e.IsDir() {
+			continue
 		}
+		if !migrate || !agentEntry(dir, e) {
+			return fmt.Errorf("data directory %s already has files in it (%s): give runcrate-host a new or empty directory (--data-dir)", dir, name)
+		}
+		others = true
+		ours = ours || name == "state.json" || name == "gpus-cache.json"
+	}
+	// Register always writes gpus-cache.json: without it (or state.json),
+	// folders named like ours aren't proof the agent made them.
+	if others && !ours {
+		return fmt.Errorf("data directory %s has no agent state (gpus-cache.json or state.json): give runcrate-host a new or empty directory (--data-dir)", dir)
 	}
 	if err := os.MkdirAll(dir, 0o711); err != nil {
 		return err
@@ -191,9 +206,50 @@ func ClaimDataDir(dir string) error {
 	return WriteFileAtomic(marker, []byte("runcrate-host data directory: VM disks and images. Removed by the uninstaller.\n"), 0o600)
 }
 
-// agentEntries are the names the agent creates in its data directory, plus
-// a fresh filesystem's lost+found.
-var agentEntries = map[string]bool{"lost+found": true, "vms": true, "images": true, "holds": true, "state.json": true, "gpus-cache.json": true}
+var vmIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
+
+// agentEntry reports whether e (in dir) is something the agent creates there,
+// with the contents the agent puts in it.
+func agentEntry(dir string, e os.DirEntry) bool {
+	p := filepath.Join(dir, e.Name())
+	switch e.Name() {
+	case "state.json", "gpus-cache.json":
+		return e.Type().IsRegular()
+	case "images":
+		return e.IsDir() && allEntries(p, func(c os.DirEntry) bool {
+			return c.Type().IsRegular() && (strings.HasSuffix(c.Name(), ".qcow2") || strings.HasPrefix(c.Name(), ".download-"))
+		})
+	case "holds":
+		return e.IsDir() && allEntries(p, func(c os.DirEntry) bool {
+			_, err := strconv.Atoi(c.Name())
+			return c.Type().IsRegular() && err == nil
+		})
+	case "vms":
+		return e.IsDir() && allEntries(p, func(c os.DirEntry) bool {
+			n := c.Name()
+			switch {
+			case strings.HasPrefix(n, ".rec-"), strings.HasPrefix(n, ".scrub-"), strings.HasPrefix(n, ".wipe-"):
+				return true
+			default:
+				return c.IsDir() && vmIDRe.MatchString(n)
+			}
+		})
+	}
+	return false
+}
+
+func allEntries(dir string, ok func(os.DirEntry) bool) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if !ok(e) {
+			return false
+		}
+	}
+	return true
+}
 
 // OwnsDataDir reports whether dir carries the marker.
 func OwnsDataDir(dir string) bool {

@@ -66,7 +66,7 @@ func snapshotGPUs(ctx context.Context, cfg *config.Config) (gpuCache, error) {
 	if t, err := exec.CommandContext(ctx, smi, "topo", "-m").Output(); err == nil {
 		c.Topo = string(t)
 	}
-	if err := config.ClaimDataDir(cfg.DataDir); err != nil {
+	if err := config.ClaimDataDir(cfg.DataDir, false); err != nil {
 		return c, err
 	}
 	b, _ := json.MarshalIndent(c, "", "  ")

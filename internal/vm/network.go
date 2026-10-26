@@ -278,6 +278,8 @@ func FirewallChanges(ctx context.Context) <-chan struct{} {
 	go func() {
 		defer close(ch)
 		sc := bufio.NewScanner(out)
+		// A large set (a fail2ban or CrowdSec blocklist) prints long lines.
+		sc.Buffer(make([]byte, 64<<10), 16<<20)
 		for sc.Scan() {
 			select {
 			case ch <- struct{}{}:

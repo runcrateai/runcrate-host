@@ -231,7 +231,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	if cred, _ := cfg.Credential(); cred != "" && cfg.HostID != "" {
 		fmt.Printf("Already registered as host %s. To register again, remove %s first.\n", cfg.HostID, cfg.CredentialPath())
 		// Claims (or migrates) the data directory of an existing install.
-		return config.ClaimDataDir(cfg.DataDir)
+		return config.ClaimDataDir(cfg.DataDir, true)
 	}
 	if *token == "" {
 		return errors.New("--token is required")
@@ -260,7 +260,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	if err := devmode.Check(cfg.APIURL); err != nil {
 		return err
 	}
-	if err := config.ClaimDataDir(cfg.DataDir); err != nil {
+	if err := config.ClaimDataDir(cfg.DataDir, false); err != nil {
 		return err
 	}
 	if err := cfg.Save(); err != nil {
