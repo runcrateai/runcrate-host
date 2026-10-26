@@ -232,7 +232,8 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	}
 	if cred, _ := cfg.Credential(); cred != "" && cfg.HostID != "" {
 		fmt.Printf("Already registered as host %s. To register again, remove %s first.\n", cfg.HostID, cfg.CredentialPath())
-		return nil
+		// Claims (or migrates) the data directory of an existing install.
+		return config.ClaimDataDir(cfg.DataDir)
 	}
 	if *token == "" {
 		return errors.New("--token is required")
@@ -442,7 +443,7 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 		return err
 	}
 	if !config.OwnsDataDir(cfg.DataDir) {
-		return fmt.Errorf("%s is not runcrate-host's data directory (no %s): register again", cfg.DataDir, config.DataMarker)
+		return fmt.Errorf("%s is not runcrate-host's data directory (no %s): mount it if it is a separate disk, or run `runcrate-host register` to claim it", cfg.DataDir, config.DataMarker)
 	}
 	if err := ensureQemuUser(ctx); err != nil {
 		return err

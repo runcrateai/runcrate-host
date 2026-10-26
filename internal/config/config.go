@@ -168,22 +168,32 @@ func (c *Config) SaveCredential(cred string) error {
 const DataMarker = ".runcrate-host-data"
 
 // ClaimDataDir makes dir runcrate-host's data directory: it must be new,
-// empty, or already carry the marker.
+// empty (a fresh filesystem's lost+found aside), hold only what the agent
+// itself creates (an install from before the marker), or already carry the
+// marker.
 func ClaimDataDir(dir string) error {
 	marker := filepath.Join(dir, DataMarker)
 	if _, err := os.Lstat(marker); err == nil {
 		return nil
 	}
-	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
-		return fmt.Errorf("data directory %s already has files in it: give runcrate-host a new or empty directory (--data-dir)", dir)
-	} else if err != nil && !os.IsNotExist(err) {
+	ents, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	for _, e := range ents {
+		if !agentEntries[e.Name()] {
+			return fmt.Errorf("data directory %s already has files in it (%s): give runcrate-host a new or empty directory (--data-dir)", dir, e.Name())
+		}
 	}
 	if err := os.MkdirAll(dir, 0o711); err != nil {
 		return err
 	}
 	return WriteFileAtomic(marker, []byte("runcrate-host data directory: VM disks and images. Removed by the uninstaller.\n"), 0o600)
 }
+
+// agentEntries are the names the agent creates in its data directory, plus
+// a fresh filesystem's lost+found.
+var agentEntries = map[string]bool{"lost+found": true, "vms": true, "images": true, "holds": true, "state.json": true, "gpus-cache.json": true}
 
 // OwnsDataDir reports whether dir carries the marker.
 func OwnsDataDir(dir string) bool {

@@ -3,7 +3,7 @@
 # driver + CUDA runtime (cudart, cuBLAS) + Fabric Manager + rc-gpubench.
 # Customer machine pieces come from cloud_init at launch, so this stays small.
 #
-#   sudo image/build.sh [version]         (Ubuntu/Debian x86_64 with KVM; no GPU needed)
+#   sudo image/build.sh [version]         (Ubuntu x86_64 with KVM and ubuntu-cloudimage-keyring; no GPU needed)
 #
 # Writes out/runcrate-vm-<version>.qcow2 and its .sha256. The agent only takes
 # a signed image: sign it (kind runcrate-vm) and upload the .sig next to it:
