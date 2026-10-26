@@ -3,10 +3,10 @@
 Plug your GPU machines into Runcrate with one command. Runcrate sells their GPUs on demand, reserved or spot at the rates you set, and pays you out. You don't need a launch API, billing or a public IP.
 
 ```sh
-curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --token <registration token>
+curl -fsSL https://get.runcrate.ai/host | sudo sh
 ```
 
-Get the token from your Runcrate partner dashboard. One token can register every machine in a cluster.
+It asks for the registration token from your Runcrate partner dashboard (input hidden). One token can register every machine in a cluster. For unattended installs, put the token in a root-only file and pass `--token-file /root/runcrate-token`.
 
 ## Requirements
 
@@ -24,10 +24,11 @@ Every step checks before it changes anything, so running it again is safe.
 
 1. Checks the OS, CPU virtualization, the GPUs and the IOMMU.
 2. Installs QEMU/KVM, OVMF, nftables, genisoimage and iperf3 (and perftest when InfiniBand is present).
-3. Installs the agent at `/usr/local/bin/runcrate-host`.
-4. Takes the GPUs off the host: stops `nvidia-persistenced` and `nvidia-fabricmanager` if they run, and moves each GPU (and the other functions of its card, such as HDMI audio) to `vfio-pci`. When Runcrate gets every GPU, a modprobe rule also claims them at boot before any host driver.
-5. Registers the machine with your token. The host credential it gets back is stored in `/etc/runcrate-host/credential`, readable by root only.
-6. Starts two systemd services: `runcrate-host-gpus` (binds the GPUs at boot) and `runcrate-host` (the agent).
+3. Creates the unprivileged `runcrate-vm` user that QEMU runs as (group `kvm`), with a udev rule giving group `kvm` access to `/dev/vhost-net`.
+4. Downloads the agent, checks its ed25519 signature against Runcrate's release key with `openssl` (it refuses to install anything unsigned), and installs it at `/usr/local/bin/runcrate-host`.
+5. Takes the GPUs off the host: stops `nvidia-persistenced` and `nvidia-fabricmanager` if they run, and moves each GPU (and the other functions of its card, such as HDMI audio) to `vfio-pci`. When Runcrate gets every GPU, a modprobe rule also claims them at boot before any host driver.
+6. Registers the machine with your token. The host credential it gets back is stored in `/etc/runcrate-host/credential`, readable by root only.
+7. Starts two systemd services: `runcrate-host-gpus` (binds the GPUs at boot) and `runcrate-host` (the agent).
 
 Options: `--name` (shown in your dashboard), `--site` (groups hosts in one location), `--gpus 0000:41:00.0,0000:42:00.0` (only these GPUs; the rest stay yours), `--data-dir`, `--yes`.
 
@@ -82,6 +83,8 @@ Reported to Runcrate: GPU health, VM states, load, the benchmark results, and th
 | `/var/lib/runcrate-host/` | VM disks, the base image, agent state (root only) |
 | `/etc/systemd/system/runcrate-host.service`, `runcrate-host-gpus.service` | services |
 | `/etc/modprobe.d/runcrate-host-vfio.conf`, `/etc/modules-load.d/runcrate-host.conf` | GPU binding at boot |
+| `/etc/udev/rules.d/90-runcrate-host.rules` | `/dev/vhost-net` for group `kvm` |
+| user `runcrate-vm` | runs QEMU, unprivileged |
 | `/etc/default/grub.d/90-runcrate-host.cfg` | only if the installer turned on the IOMMU |
 
 Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runcrate-host console <vm id>` (a VM's serial console).
@@ -92,13 +95,15 @@ Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runc
 curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall
 ```
 
-This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot rules and the IOMMU GRUB line it added, and deletes the agent, its config and its data. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
+This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot and udev rules and the IOMMU GRUB line it added, the `runcrate-vm` user, the agent and its config. In the data directory it deletes only what the agent created (`vms/`, `images/`, `holds/`, `state.json`, `gpus-cache.json`), and the directory itself only if that leaves it empty. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
 
 ## Development
 
 ```sh
 go test ./...
-make release VERSION=0.1.0           # out/runcrate-host-linux-amd64 and .sha256
+make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
+RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
+  go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64   # .sig
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
 ```
 

@@ -149,9 +149,12 @@ write_files:
       rm -f /etc/ssh/ssh_host_*
       cloud-init clean --logs --seed --machine-id || { cloud-init clean --logs --seed; truncate -s0 /etc/machine-id; }
       fstrim -av || true
-      echo RUNCRATE-IMAGE-BUILD-OK > /dev/ttyS0
+      echo RUNCRATE-IMAGE-BUILD-OK
+# Provisioning logs to the second serial port (ttyS1). Not ttyS0: that is the
+# console, and when serial-getty starts there mid-run, agetty's vhangup()
+# kills whatever is writing to it (apt-get died that way at about 80 s).
 runcmd:
-  - [bash, -c, "/root/provision.sh > /dev/ttyS0 2>&1 || echo RUNCRATE-IMAGE-BUILD-FAILED > /dev/ttyS0; rm -f /root/provision.sh; sync; poweroff"]
+  - [bash, -c, "/root/provision.sh < /dev/null > /dev/ttyS1 2>&1 || echo RUNCRATE-IMAGE-BUILD-FAILED > /dev/ttyS1; rm -f /root/provision.sh; sync; poweroff"]
 EOF
 printf 'instance-id: runcrate-image-build\nlocal-hostname: runcrate-image\n' > "$work/seed/meta-data"
 genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock "$work/seed/user-data" "$work/seed/meta-data"
@@ -160,11 +163,14 @@ timeout 90m qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp "$(nproc)" 
 	-drive file="$work/build.qcow2",if=virtio,format=qcow2,discard=unmap \
 	-drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-	-serial file:"$work/serial.log" -no-reboot
+	-serial file:"$work/console.log" -serial file:"$work/provision.log" -no-reboot
 
-if ! grep -q RUNCRATE-IMAGE-BUILD-OK "$work/serial.log"; then
-	tail -n 80 "$work/serial.log" >&2
-	echo "image build failed (serial log above)" >&2
+if ! grep -q RUNCRATE-IMAGE-BUILD-OK "$work/provision.log"; then
+	cp "$work/provision.log" "$OUT/runcrate-vm-$VERSION.build.log"
+	cp "$work/console.log" "$OUT/runcrate-vm-$VERSION.console.log"
+	grep -q RUNCRATE-IMAGE-BUILD-FAILED "$work/provision.log" || echo "the provision script never reported (no RUNCRATE-IMAGE-BUILD-* line)" >&2
+	tail -n 60 "$work/provision.log" >&2
+	echo "image build failed; logs: $OUT/runcrate-vm-$VERSION.build.log and .console.log" >&2
 	exit 1
 fi
 
@@ -172,6 +178,6 @@ echo "==> Compressing"
 img="$OUT/runcrate-vm-$VERSION.qcow2"
 qemu-img convert -q -c -O qcow2 "$work/build.qcow2" "$img"
 (cd "$OUT" && sha256sum "runcrate-vm-$VERSION.qcow2" > "runcrate-vm-$VERSION.qcow2.sha256")
-cp "$work/serial.log" "$OUT/runcrate-vm-$VERSION.build.log"
+cp "$work/provision.log" "$OUT/runcrate-vm-$VERSION.build.log"
 ls -la "$img"
 cat "$img.sha256"

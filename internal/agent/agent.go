@@ -74,6 +74,10 @@ type Agent struct {
 	// UnauthorizedGrace is how long 401s must last before the agent stops
 	// (default 30 minutes).
 	UnauthorizedGrace time.Duration
+	// DevGPUs is set only in devnopassthrough builds with the switch on: the
+	// benchmark VM boots without GPUs, so each GPU is reported as the host
+	// sees it (name, UUID, VRAM) with its checks marked passed.
+	DevGPUs func(index int) (name, uuid string, vramGB int)
 
 	interval time.Duration
 	flushMu  sync.Mutex
@@ -477,6 +481,15 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		}
 		if vb.Error != "" {
 			gpuErr = vb.Error
+		}
+		if a.DevGPUs != nil && err == nil {
+			// The VM booted and ran the script; there are no GPUs in it.
+			gpuErr, vb.GPUs = "", nil
+			for _, idx := range free {
+				name, uuid, vram := a.DevGPUs(idx)
+				vb.GPUs = append(vb.GPUs, vmGPU{Ordinal: len(vb.GPUs), Name: name, UUID: uuid, VRAMGB: float64(vram),
+					MemOK: true, MatmulOK: true, NvidiaSMI: "devnopassthrough: not measured"})
+			}
 		}
 		for idx, v := range a.matchGPUs(free, vb.GPUs) {
 			g := api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr}

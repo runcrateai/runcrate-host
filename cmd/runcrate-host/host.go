@@ -167,6 +167,18 @@ func (h *host) GPUAddress(i int) string {
 	return ""
 }
 
+// GPUIdentity is what the host knows of a GPU (devnopassthrough benchmarks).
+func (h *host) GPUIdentity(i int) (name, uuid string, vramGB int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, g := range h.gpus {
+		if g.Index == i {
+			return g.ModelRaw, g.UUID, g.VRAMGB
+		}
+	}
+	return "", "", 0
+}
+
 func (h *host) Load() api.Load {
 	total, avail := h.sys.Mem()
 	free, _ := hw.DiskFree(h.cfg.DataDir)

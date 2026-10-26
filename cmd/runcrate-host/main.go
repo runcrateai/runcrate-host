@@ -504,6 +504,9 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 		},
 		Restart: cancel,
 	}
+	if devmode.NoPassthrough() {
+		a.DevGPUs = rt.host.GPUIdentity
+	}
 	log.Info("runcrate-host started", "version", version, "host_id", cfg.HostID, "gpus", len(rt.host.gpus), "api", cfg.APIURL)
 	runErr := make(chan error, 1)
 	go func() { runErr <- a.Run(ctx) }()
