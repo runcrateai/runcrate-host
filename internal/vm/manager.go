@@ -226,8 +226,8 @@ func (m *Manager) Load(ctx context.Context, resume bool) error {
 	}
 	var scrubs []pending
 	for _, e := range ents {
-		if !resume && strings.HasPrefix(e.Name(), ".") {
-			continue
+		if !resume && (strings.HasPrefix(e.Name(), ".scrub-") || strings.HasPrefix(e.Name(), ".wipe-")) {
+			continue // background work; uninstall only needs the records
 		}
 		if id, ok := strings.CutPrefix(e.Name(), ".scrub-"); ok {
 			var gpus []int

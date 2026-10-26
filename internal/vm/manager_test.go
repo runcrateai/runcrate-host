@@ -391,6 +391,14 @@ func TestLoadResumesRunningAndDropsHalfMade(t *testing.T) {
 		Meta: metadata.New(f.m.Net.Subnet), Run: host, Sys: f.m.Sys, VFIO: f.m.VFIO, Images: f.m.Images,
 		Firmware: f.m.Firmware, Log: f.m.Log, GPUs: f.m.GPUs, HostThreads: 64, HostRAMGB: 512, BootWait: time.Millisecond,
 	}
+	// Uninstall reads the records without resuming anything; it must see both.
+	m3 := &Manager{DataDir: f.m.DataDir, Net: m2.Net, Meta: m2.Meta, Run: host, Sys: f.m.Sys, VFIO: f.m.VFIO, Log: f.m.Log}
+	if err := m3.Load(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if ids := m3.IDs(); len(ids) != 2 || ids[0] != "vm-half" || ids[1] != "vm-run" {
+		t.Fatalf("Load without resume found %v, want [vm-half vm-run]", ids)
+	}
 	if err := m2.Load(ctx, true); err != nil {
 		t.Fatal(err)
 	}
