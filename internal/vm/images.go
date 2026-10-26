@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/sysexec"
+	"github.com/runcrateai/runcrate-host/internal/update"
 )
 
 var versionRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
@@ -31,20 +34,25 @@ type ImageStore struct {
 	Dir  string
 	API  ImageAPI
 	HTTP *http.Client
+	Run  sysexec.Runner
+	// Verify checks the release signature over (version, sha256).
+	Verify func(ctx context.Context, img *api.Image) error
+	// Used lists versions still under VM disks (kept when pruning).
+	Used InUse
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	flights map[string]*flight
 }
 
 func (s *ImageStore) path(version string) string { return filepath.Join(s.Dir, version+".qcow2") }
 
 // Ensure returns the local path of an image version ("" = current),
-// downloading it when missing.
+// downloading it when missing. Concurrent callers for one version share one
+// download; waiting honours ctx.
 func (s *ImageStore) Ensure(ctx context.Context, version string) (string, string, error) {
 	if version != "" && !versionRe.MatchString(version) {
 		return "", "", fmt.Errorf("bad image version %q", version)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if version != "" {
 		if _, err := os.Stat(s.path(version)); err == nil {
 			return s.path(version), version, nil
@@ -60,10 +68,92 @@ func (s *ImageStore) Ensure(ctx context.Context, version string) (string, string
 	if _, err := os.Stat(s.path(img.Version)); err == nil {
 		return s.path(img.Version), img.Version, nil
 	}
-	if err := s.download(ctx, img); err != nil {
+	if err := s.once(ctx, img); err != nil {
 		return "", "", err
 	}
+	if version == "" {
+		s.prune(img.Version)
+	}
 	return s.path(img.Version), img.Version, nil
+}
+
+// Local returns version if present, else the newest image on disk, and
+// only asks the API when there is none.
+func (s *ImageStore) Local(ctx context.Context, version string) (string, string, error) {
+	if version != "" {
+		return s.Ensure(ctx, version)
+	}
+	ents, _ := os.ReadDir(s.Dir)
+	var newest os.DirEntry
+	var at time.Time
+	for _, e := range ents {
+		v, ok := strings.CutSuffix(e.Name(), ".qcow2")
+		if !ok || !versionRe.MatchString(v) {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && fi.ModTime().After(at) {
+			newest, at = e, fi.ModTime()
+		}
+	}
+	if newest != nil {
+		v := strings.TrimSuffix(newest.Name(), ".qcow2")
+		return s.path(v), v, nil
+	}
+	return s.Ensure(ctx, "")
+}
+
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+// once runs one download per version at a time.
+func (s *ImageStore) once(ctx context.Context, img *api.Image) error {
+	s.mu.Lock()
+	if s.flights == nil {
+		s.flights = map[string]*flight{}
+	}
+	f, running := s.flights[img.Version]
+	if !running {
+		f = &flight{done: make(chan struct{})}
+		s.flights[img.Version] = f
+	}
+	s.mu.Unlock()
+	if !running {
+		// The download outlives one caller's ctx; others may be waiting.
+		go func() {
+			f.err = s.download(context.WithoutCancel(ctx), img)
+			s.mu.Lock()
+			delete(s.flights, img.Version)
+			s.mu.Unlock()
+			close(f.done)
+		}()
+	}
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// InUse reports image versions VM disks are layered on.
+type InUse func() map[string]bool
+
+// prune deletes images other than keep that no VM uses.
+func (s *ImageStore) prune(keep string) {
+	if s.Used == nil {
+		return
+	}
+	used := s.Used()
+	ents, _ := os.ReadDir(s.Dir)
+	for _, e := range ents {
+		v, ok := strings.CutSuffix(e.Name(), ".qcow2")
+		if !ok || v == keep || used[v] {
+			continue
+		}
+		_ = os.Remove(filepath.Join(s.Dir, e.Name()))
+	}
 }
 
 func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
@@ -75,12 +165,19 @@ func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
 	if len(want) != 64 {
 		return fmt.Errorf("image sha256 %q is not a sha256", img.SHA256)
 	}
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	if s.Verify != nil {
+		if err := s.Verify(ctx, img); err != nil {
+			return fmt.Errorf("image signature: %w", err)
+		}
+	}
+	// 0711/0444: the unprivileged QEMU reads images, nobody else lists them.
+	if err := os.MkdirAll(s.Dir, 0o711); err != nil {
 		return err
 	}
+	_ = os.Chmod(s.Dir, 0o711)
 	client := s.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: 2 * time.Hour}
+		client = &http.Client{Timeout: 2 * time.Hour, CheckRedirect: update.HTTPSOnly}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, img.URL, nil)
 	if err != nil {
@@ -110,22 +207,39 @@ func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
 	if got := hex.EncodeToString(h.Sum(nil)); got != want {
 		return fmt.Errorf("image sha256 mismatch: got %s, want %s", got, want)
 	}
-	if err := os.Chmod(tmp.Name(), 0o400); err != nil {
+	if err := s.selfContained(ctx, tmp.Name()); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o444); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), s.path(img.Version))
 }
 
-// Prune deletes images other than keep that no VM disk uses.
-func (s *ImageStore) Prune(keep string, inUse map[string]bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ents, _ := os.ReadDir(s.Dir)
-	for _, e := range ents {
-		v, ok := strings.CutSuffix(e.Name(), ".qcow2")
-		if !ok || v == keep || inUse[v] {
-			continue
-		}
-		_ = os.Remove(filepath.Join(s.Dir, e.Name()))
+// selfContained refuses an image that is not a plain qcow2: a backing file
+// or an external data file in its header could point QEMU at host disks.
+func (s *ImageStore) selfContained(ctx context.Context, p string) error {
+	if s.Run == nil {
+		return nil
 	}
+	out, err := s.Run.Run(ctx, "qemu-img", "info", "-f", "qcow2", "--output=json", p)
+	if err != nil {
+		return fmt.Errorf("image is not a readable qcow2: %w", err)
+	}
+	var info struct {
+		Format  string `json:"format"`
+		Backing string `json:"backing-filename"`
+		Spec    struct {
+			Data struct {
+				DataFile string `json:"data-file"`
+			} `json:"data"`
+		} `json:"format-specific"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return fmt.Errorf("image info: %w", err)
+	}
+	if info.Format != "qcow2" || info.Backing != "" || info.Spec.Data.DataFile != "" {
+		return fmt.Errorf("image must be a self-contained qcow2 (format %q, backing %q, data file %q)", info.Format, info.Backing, info.Spec.Data.DataFile)
+	}
+	return nil
 }

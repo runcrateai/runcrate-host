@@ -100,7 +100,6 @@ type Load struct {
 	MemUsedGB  float64 `json:"mem_used_gb"`
 	MemTotalGB float64 `json:"mem_total_gb"`
 	DiskFreeGB float64 `json:"disk_free_gb"`
-	Draining   bool    `json:"draining"`
 }
 
 // HeartbeatRequest is POST /heartbeat.

@@ -14,8 +14,28 @@ if lspci -nd 10de: 2>/dev/null | grep -q ' 0680:'; then systemctl start nvidia-f
 for i in $(seq 90); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
 `
 
-// ScrubScript overwrites every GPU's memory with zeros.
+// ScrubScript puts back what a tenant may have changed and persists on the
+// card (MIG mode, ECC off, clock locks), then overwrites every GPU's memory
+// with zeros.
 const ScrubScript = ephemeralPrelude + `
+modes() { nvidia-smi --query-gpu=index,ecc.mode.current,ecc.mode.pending,mig.mode.current,mig.mode.pending --format=csv,noheader 2>/dev/null; }
+n=$(nvidia-smi -L 2>/dev/null | wc -l)
+for i in $(seq 0 $((n - 1))); do
+  nvidia-smi -i "$i" -mig 0 >/dev/null 2>&1 || true
+  nvidia-smi -i "$i" -e 1 >/dev/null 2>&1 || true
+  nvidia-smi -i "$i" -rgc >/dev/null 2>&1 || true
+  nvidia-smi -i "$i" -rmc >/dev/null 2>&1 || true
+  nvidia-smi -i "$i" -rac >/dev/null 2>&1 || true
+done
+# Pending ECC or MIG changes take effect on a GPU reset.
+modes | while IFS=', ' read -r i ec ep mc mp; do
+  if [ "$ec" != "$ep" ] || [ "$mc" != "$mp" ]; then nvidia-smi -r -i "$i" >/dev/null 2>&1 || true; fi
+done
+bad=$(modes | awk -F', ' '($2 != "Enabled" && $2 != "[N/A]") || ($4 != "Disabled" && $4 != "[N/A]") {print "gpu " $1 ": ecc " $2 ", mig " $4}')
+if [ -n "$bad" ]; then
+  printf '{"ok":false,"error":"GPU modes could not be reset: %s"}' "$(echo $bad)" > "$out/result.json"
+  post "$out/result.json"; sync; poweroff; exit 0
+fi
 if ! /usr/local/bin/rc-gpubench --scrub > "$out/result.json" 2> "$out/err.txt"; then
   [ -s "$out/result.json" ] || printf '{"ok":false,"error":"rc-gpubench failed"}' > "$out/result.json"
 fi

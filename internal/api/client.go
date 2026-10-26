@@ -56,7 +56,11 @@ func New(baseURL, credential, version string) (*Client, error) {
 		BaseURL:    u.String(),
 		Credential: credential,
 		UserAgent:  "runcrate-host/" + version,
-		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		// The host API never redirects; following one could carry the
+		// credential somewhere else (or to plain http on the same host).
+		HTTP: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 	}, nil
 }
 

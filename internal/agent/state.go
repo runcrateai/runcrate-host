@@ -26,7 +26,6 @@ type Outgoing struct {
 
 // State is what the agent must remember across restarts.
 type State struct {
-	Draining      bool                `json:"draining"`
 	Outbox        []Outgoing          `json:"outbox"`
 	Done          map[int64]time.Time `json:"done"`
 	PendingUpdate *PendingUpdate      `json:"pending_update,omitempty"`

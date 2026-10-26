@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,8 +22,10 @@ import (
 	"github.com/runcrateai/runcrate-host/internal/api"
 	"github.com/runcrateai/runcrate-host/internal/bench"
 	"github.com/runcrateai/runcrate-host/internal/config"
+	"github.com/runcrateai/runcrate-host/internal/devmode"
 	"github.com/runcrateai/runcrate-host/internal/hw"
 	"github.com/runcrateai/runcrate-host/internal/metadata"
+	"github.com/runcrateai/runcrate-host/internal/release"
 	"github.com/runcrateai/runcrate-host/internal/sysexec"
 	"github.com/runcrateai/runcrate-host/internal/update"
 	"github.com/runcrateai/runcrate-host/internal/vfio"
@@ -31,6 +34,9 @@ import (
 
 // version is set at build time (-ldflags "-X main.version=...").
 var version = "dev"
+
+// qemuUser runs QEMU (created by the installer, in group kvm).
+const qemuUser = "runcrate-vm"
 
 // exitUnauthorized tells systemd not to restart (RestartPreventExitStatus).
 const exitUnauthorized = 3
@@ -111,11 +117,30 @@ func withConfig(dir string, fn func(*config.Config) error) error {
 	return fn(cfg)
 }
 
+// inventory lists the GPUs Runcrate uses. After registration their indexes
+// are the registered ones (cfg.GPUIndex), so a missing card never shifts the
+// others; before it, every passable GPU is numbered in address order.
 func inventory(cfg *config.Config) ([]hw.GPU, []string, gpuCache, error) {
 	cache := loadGPUCache(cfg)
-	gpus, err := hw.Host.GPUs(cfg.GPUs, cache.GPUs, hw.LoadPCIIDs(hw.DefaultPCIIDsPaths...))
+	all, err := hw.Host.GPUs(cfg.GPUs, cache.GPUs, hw.LoadPCIIDs(hw.DefaultPCIIDsPaths...))
 	if err != nil {
 		return nil, nil, cache, err
+	}
+	var gpus []hw.GPU
+	for _, g := range all {
+		if len(cfg.GPUIndex) > 0 {
+			idx, ok := cfg.GPUIndex[g.Address]
+			if !ok {
+				continue
+			}
+			g.Index = idx
+		} else {
+			if g.Blocker != "" && !devmode.NoPassthrough() {
+				continue
+			}
+			g.Index = len(gpus)
+		}
+		gpus = append(gpus, g)
 	}
 	var sw []string
 	if devs, err := hw.Host.NVSwitches(); err == nil {
@@ -129,6 +154,9 @@ func inventory(cfg *config.Config) ([]hw.GPU, []string, gpuCache, error) {
 // bindGPUs moves every usable configured GPU (and its companions and any
 // NVSwitches) to vfio-pci.
 func bindGPUs(cfg *config.Config) error {
+	if devmode.NoPassthrough() {
+		return nil
+	}
 	gpus, sw, _, err := inventory(cfg)
 	if err != nil {
 		return err
@@ -224,6 +252,9 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	if err := devmode.Check(cfg.APIURL); err != nil {
+		return err
+	}
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -235,13 +266,30 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 		return err
 	}
 	if len(list) == 0 {
-		return errors.New("no NVIDIA GPUs found")
+		var why []string
+		all, _ := hw.Host.GPUs(cfg.GPUs, cache.GPUs, hw.LoadPCIIDs(hw.DefaultPCIIDsPaths...))
+		for _, g := range all {
+			why = append(why, g.Address+": "+g.Blocker)
+		}
+		if len(why) == 0 {
+			return errors.New("no NVIDIA GPUs found")
+		}
+		return fmt.Errorf("no GPU can be passed through:\n  %s", strings.Join(why, "\n  "))
+	}
+	cfg.GPUIndex = map[string]int{}
+	for _, g := range list {
+		cfg.GPUIndex[g.Address] = g.Index
 	}
 	_, subnet, _ := net.ParseCIDR(cfg.VMSubnet)
 	h := &host{cfg: cfg, sys: hw.Host, gpus: list, nvswitches: sw, cacheTopo: cache.Topo, subnet: subnet}
 	model, cores, threads := hw.Host.CPU()
 	total, _ := hw.Host.Mem()
-	free, _ := hw.DiskFree(cfg.DataDir)
+	// What VM disks can use: free space less the host reserve and the image.
+	free, _ := hw.DiskFree(filepath.Dir(cfg.DataDir))
+	if f, _ := hw.DiskFree(cfg.DataDir); f > 0 {
+		free = f
+	}
+	usableDisk := max(int64(free>>30)-vm.ReserveDiskGB-vm.ImageAllowanceGB, 0)
 	req := api.RegisterRequest{
 		RegistrationToken: *token,
 		RequestID:         registerRequestID(cfg),
@@ -250,7 +298,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 			Specs: api.Specs{
 				CPU:      api.CPUSpec{Model: model, Cores: cores, Threads: threads},
 				RAMGB:    int(total >> 30),
-				DiskGB:   int(free >> 30),
+				DiskGB:   int(usableDisk),
 				Topology: h.Topology(),
 			},
 			AgentVersion: version,
@@ -278,7 +326,8 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	for attempt := 1; ; attempt++ {
 		resp, err = client.Register(ctx, req)
 		var he *api.HTTPError
-		if err == nil || (errors.As(err, &he) && !he.Retryable()) || attempt == 5 {
+		// 409: the same request is still being processed; ask again.
+		if err == nil || (errors.As(err, &he) && !he.Retryable() && he.Status != 409) || attempt == 5 {
 			break
 		}
 		time.Sleep(time.Duration(attempt) * 3 * time.Second)
@@ -290,6 +339,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 		return err
 	}
 	cfg.HostID = resp.HostID
+	// Remember which GPUs were registered with which index.
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -343,6 +393,9 @@ func buildRuntime(cfg *config.Config, log *slog.Logger, cred string) (*runtime, 
 	if err != nil {
 		return nil, err
 	}
+	if err := devmode.Check(cfg.APIURL); err != nil {
+		return nil, err
+	}
 	_, _, threads := hw.Host.CPU()
 	total, _ := hw.Host.Mem()
 	run := sysexec.Exec{}
@@ -350,11 +403,16 @@ func buildRuntime(cfg *config.Config, log *slog.Logger, cred string) (*runtime, 
 	meta := metadata.New(subnet)
 	mgr := &vm.Manager{
 		DataDir: cfg.DataDir, Net: n, Meta: meta, Run: run, Sys: hw.Host, VFIO: vfio.Sysfs{Root: "/"},
-		Images:   &vm.ImageStore{Dir: filepath.Join(cfg.DataDir, "images"), API: client},
+		Images: &vm.ImageStore{Dir: filepath.Join(cfg.DataDir, "images"), API: client, Run: run,
+			Verify: func(ctx context.Context, img *api.Image) error {
+				return release.Fetch(ctx, nil, release.KindImage, img.Version, img.SHA256, img.URL)
+			}},
+		QemuUser: qemuUser,
 		Firmware: fw, Log: log, GPUs: gpus, NVSwitches: sw,
-		HostThreads: threads, HostRAMGB: int(total >> 30), Scrub: cfg.ScrubGPUs,
+		HostThreads: threads, HostRAMGB: int(total >> 30), Scrub: cfg.ScrubGPUs && !devmode.NoPassthrough(),
+		NoPassthrough: devmode.NoPassthrough(),
 	}
-	h := &host{cfg: cfg, sys: hw.Host, gpus: gpus, nvswitches: sw, cacheTopo: cache.Topo, subnet: subnet, speed: bench.DefaultSpeedTest}
+	h := &host{cfg: cfg, sys: hw.Host, gpus: gpus, nvswitches: sw, cacheTopo: cache.Topo, subnet: subnet, speed: bench.DefaultSpeedTest, mgr: mgr}
 	return &runtime{cfg: cfg, net: n, meta: meta, mgr: mgr, host: h, client: client}, nil
 }
 
@@ -374,7 +432,10 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o711); err != nil {
+		return err
+	}
+	if err := ensureQemuUser(ctx); err != nil {
 		return err
 	}
 	if err := rt.net.Setup(ctx); err != nil {
@@ -384,11 +445,35 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 		// Report and keep going: unusable GPUs show as failed.
 		log.Error("bind gpus", "err", err)
 	}
+	// Two lifetimes: ctx ends the agent loop; the manager's scrubs get their
+	// own context, cancelled last, and never block the shutdown (a cancelled
+	// scrub resumes after the restart).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	mgrCtx, mgrCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer mgrCancel()
+	rt.mgr.Ctx = mgrCtx
+	if store, ok := rt.mgr.Images.(*vm.ImageStore); ok {
+		store.Used = rt.mgr.ImagesInUse
+	}
 	metaErr := make(chan error, 1)
 	go func() {
-		metaErr <- rt.meta.Serve(ctx, fmt.Sprintf("0.0.0.0:%d", vm.MetadataPort))
+		metaErr <- rt.meta.Serve(mgrCtx, fmt.Sprintf("0.0.0.0:%d", vm.MetadataPort))
+	}()
+	// Keep the firewall in place: a partner restarting nftables flushes it.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-mgrCtx.Done():
+				return
+			case <-t.C:
+				if err := rt.net.Reconcile(mgrCtx); err != nil {
+					log.Error("firewall", "err", err)
+				}
+			}
+		}
 	}()
 	if err := rt.mgr.Load(ctx, true); err != nil {
 		return err
@@ -412,6 +497,9 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 	a := &agent.Agent{
 		Version: version, API: rt.client, VMs: rt.mgr, Host: rt.host, State: state, Log: log,
 		Update: func(ctx context.Context, u api.UpdateAgent) error {
+			if err := release.Fetch(ctx, nil, release.KindAgent, u.Version, u.SHA256, u.URL); err != nil {
+				return err
+			}
 			return update.Apply(ctx, nil, u.URL, u.SHA256, self)
 		},
 		Restart: cancel,
@@ -423,12 +511,26 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 	case err := <-metaErr:
 		cancel()
 		<-runErr
-		return fmt.Errorf("metadata server: %w", err)
+		if err != nil {
+			return fmt.Errorf("metadata server: %w", err)
+		}
+		return nil
 	case err := <-runErr:
 		cancel()
-		rt.mgr.Wait()
+		mgrCancel()
 		return err
 	}
+}
+
+// ensureQemuUser creates the unprivileged user QEMU runs as (the installer
+// does too; this covers updated agents).
+func ensureQemuUser(ctx context.Context) error {
+	if _, err := user.Lookup(qemuUser); err == nil {
+		return nil
+	}
+	_, err := sysexec.Exec{}.Run(ctx, "useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent",
+		"--shell", "/usr/sbin/nologin", "--groups", "kvm", qemuUser)
+	return err
 }
 
 func cmdStatus(ctx context.Context, dir string) error {
@@ -512,6 +614,12 @@ func console(cfg *config.Config, id string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(out)
+	// The guest writes this: never hand its escape sequences to a terminal.
+	fmt.Print(strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)) {
+			return r
+		}
+		return '?'
+	}, out))
 	return nil
 }

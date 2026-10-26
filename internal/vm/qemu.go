@@ -31,11 +31,14 @@ func FindFirmware() (Firmware, error) {
 
 // QemuSpec is everything needed to start one VM.
 type QemuSpec struct {
-	Name     string
-	Dir      string
-	VCPUs    int
-	RAMGB    int
-	Disk     string
+	Name  string
+	Dir   string
+	VCPUs int
+	RAMGB int
+	Disk  string
+	// Base is the read-only image under Disk, named explicitly so the
+	// overlay header's backing reference is never followed.
+	Base     string
 	Seed     string
 	Tap      string
 	MAC      string
@@ -51,8 +54,9 @@ type QemuSpec struct {
 func (s QemuSpec) Args() []string {
 	a := []string{
 		"-name", "guest=" + s.Name + ",debug-threads=on",
-		"-machine", "q35,accel=kvm,kernel-irqchip=on",
-		"-cpu", "host,host-phys-bits=on",
+		"-machine", "q35,accel=kvm,kernel-irqchip=on,vmport=off,dump-guest-core=off,mem-merge=off",
+		// No nested virtualisation for guests.
+		"-cpu", "host,host-phys-bits=on,-vmx,-svm",
 		"-smp", fmt.Sprintf("%d,sockets=1,cores=%d,threads=1", s.VCPUs, s.VCPUs),
 		"-m", fmt.Sprintf("%dG", s.RAMGB),
 		"-nodefaults", "-no-user-config",
@@ -64,9 +68,13 @@ func (s QemuSpec) Args() []string {
 		"-drive", "if=pflash,format=raw,unit=1,file=" + filepath.Join(s.Dir, "OVMF_VARS.fd"),
 		"-global", fmt.Sprintf("q35-pcihost.pci-hole64-size=%dM", s.MMIO64MB),
 		"-fw_cfg", fmt.Sprintf("name=opt/ovmf/X-PciMmio64Mb,string=%d", s.MMIO64MB),
-		"-drive", "file=" + s.Disk + ",if=none,id=disk0,format=qcow2,cache=none,aio=threads,discard=unmap,detect-zeroes=unmap",
+		"-blockdev", "driver=file,filename=" + s.Base + ",node-name=base-file,read-only=on",
+		"-blockdev", "driver=qcow2,file=base-file,node-name=base,read-only=on,backing=",
+		"-blockdev", "driver=file,filename=" + s.Disk + ",node-name=disk-file,cache.direct=on,aio=threads,discard=unmap",
+		"-blockdev", "driver=qcow2,file=disk-file,node-name=disk0,backing=base,discard=unmap,detect-zeroes=unmap",
 		"-device", "virtio-blk-pci,drive=disk0,bootindex=1",
-		"-drive", "file=" + s.Seed + ",if=none,id=seed0,format=raw,readonly=on",
+		"-blockdev", "driver=file,filename=" + s.Seed + ",node-name=seed-file,read-only=on",
+		"-blockdev", "driver=raw,file=seed-file,node-name=seed0,read-only=on",
 		"-device", "virtio-blk-pci,drive=seed0",
 		"-netdev", "tap,id=net0,ifname=" + s.Tap + ",script=no,downscript=no,vhost=on",
 		"-device", "virtio-net-pci,netdev=net0,mac=" + s.MAC,

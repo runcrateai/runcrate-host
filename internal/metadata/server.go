@@ -124,6 +124,18 @@ func (s *Server) Result(ctx context.Context, guestIP string) ([]byte, error) {
 
 type ctxKey struct{}
 
+// hostSide is the host address (.1) of the /30 a guest address is in.
+func hostSide(guest net.IP) net.IP {
+	g := guest.To4()
+	if g == nil {
+		return nil
+	}
+	h := make(net.IP, 4)
+	copy(h, g)
+	h[3] = h[3]&^3 | 1
+	return h
+}
+
 // guard admits only requests that arrived on a VM tap from a known VM.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,8 +145,9 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		// The request must have arrived on the VM's own /30: its host side.
 		if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-			if tcp, ok := la.(*net.TCPAddr); ok && !s.subnet.Contains(tcp.IP) {
+			if tcp, ok := la.(*net.TCPAddr); ok && !tcp.IP.Equal(hostSide(ip)) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}

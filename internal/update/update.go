@@ -17,6 +17,17 @@ import (
 	"time"
 )
 
+// HTTPSOnly is a CheckRedirect that refuses redirects off https.
+func HTTPSOnly(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("redirect to %s refused", req.URL.Scheme)
+	}
+	if len(via) >= 10 {
+		return fmt.Errorf("too many redirects")
+	}
+	return nil
+}
+
 // Apply downloads the binary at rawURL, verifies it against sha (hex) and
 // replaces target. The caller restarts the process afterwards.
 func Apply(ctx context.Context, client *http.Client, rawURL, sha, target string) error {
@@ -29,7 +40,7 @@ func Apply(ctx context.Context, client *http.Client, rawURL, sha, target string)
 		return fmt.Errorf("update sha256 is not a sha256")
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
+		client = &http.Client{Timeout: 10 * time.Minute, CheckRedirect: HTTPSOnly}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {

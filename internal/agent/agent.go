@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/release"
 	"github.com/runcrateai/runcrate-host/internal/vm"
 )
 
@@ -34,6 +35,7 @@ type VMs interface {
 	FreeGPUs(withHeld bool) []int
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
+	Hold(gpus []int)
 	RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error)
 }
 
@@ -41,6 +43,12 @@ type VMs interface {
 type Host interface {
 	GPUs() []api.GPUStatus
 	GPUAddress(index int) string
+	// GPUUUID is the GPU's UUID when known (from the host driver or an
+	// earlier benchmark), to match benchmark results to indexes.
+	GPUUUID(index int) string
+	// LearnUUIDs records GPU UUIDs seen by a benchmark, to match later
+	// scrubs and benchmarks exactly.
+	LearnUUIDs(byIndex map[int]string)
 	Load() api.Load
 	Topology() api.Topology
 	HostID() string
@@ -63,6 +71,9 @@ type Agent struct {
 	Update func(ctx context.Context, u api.UpdateAgent) error
 	// Restart is called after a successful update (cancel the run context).
 	Restart func()
+	// UnauthorizedGrace is how long 401s must last before the agent stops
+	// (default 30 minutes).
+	UnauthorizedGrace time.Duration
 
 	interval time.Duration
 	flushMu  sync.Mutex
@@ -79,6 +90,13 @@ const (
 	MinInterval     = 2 * time.Second
 	MaxInterval     = 5 * time.Minute
 )
+
+func (a *Agent) unauthorizedGrace() time.Duration {
+	if a.UnauthorizedGrace > 0 {
+		return a.UnauthorizedGrace
+	}
+	return 30 * time.Minute
+}
 
 func (a *Agent) init() {
 	if a.inflight == nil {
@@ -97,22 +115,38 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.init()
 	a.reportUpdate()
 	backoff := time.Second
+	var rejectedSince time.Time
 	for {
 		err := a.Tick(ctx)
 		switch {
 		case errors.Is(err, api.ErrUnauthorized):
-			a.wg.Wait()
-			return err
+			// A revoked credential stays rejected; a control-plane blip
+			// doesn't. Give up only after UnauthorizedGrace of rejections.
+			if rejectedSince.IsZero() {
+				rejectedSince = time.Now()
+			}
+			if time.Since(rejectedSince) >= a.unauthorizedGrace() {
+				a.wg.Wait()
+				return err
+			}
+			a.Log.Warn("credential rejected; retrying", "since", rejectedSince)
+			backoff = min(time.Minute, a.unauthorizedGrace())
+		case err != nil:
+			rejectedSince = time.Time{}
 		case err != nil:
 			a.Log.Warn("heartbeat failed", "err", err)
 			// Back off on errors, never slower than the max interval.
 			backoff = min(backoff*2, MaxInterval)
 		default:
+			rejectedSince = time.Time{}
 			backoff = time.Second
 		}
 		wait := a.interval
 		if err != nil {
-			wait = min(a.interval, backoff)
+			wait = backoff
+			if !errors.Is(err, api.ErrUnauthorized) {
+				wait = min(a.interval, backoff)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -130,10 +164,7 @@ func (a *Agent) Wait() { a.wg.Wait() }
 // Tick sends one heartbeat, flushes unsent results and starts new commands.
 func (a *Agent) Tick(ctx context.Context) error {
 	a.init()
-	var draining bool
-	a.State.view(func(s *State) { draining = s.Draining })
 	load := a.Host.Load()
-	load.Draining = draining
 	gpus := a.Host.GPUs()
 	held := a.VMs.HeldGPUs()
 	for i := range gpus {
@@ -226,6 +257,13 @@ func (a *Agent) flush(ctx context.Context) error {
 	for _, o := range out {
 		err := a.API.Result(ctx, o.CommandID, o.Result)
 		var he *api.HTTPError
+		if errors.As(err, &he) && (he.Status == 400 || he.Status == 413) && o.Result.Status == "done" {
+			// The control plane refused the body: settle the command as failed
+			// with a short reason instead of leaving it pending.
+			short := api.CommandResult{RequestID: o.Result.RequestID, Status: "failed",
+				Result: map[string]any{"error": fmt.Sprintf("result refused by the control plane (HTTP %d)", he.Status)}}
+			err = a.API.Result(ctx, o.CommandID, short)
+		}
 		switch {
 		case err == nil, errors.As(err, &he) && !he.Retryable() && he.Status != 408:
 			// Accepted, or refused for good (unknown command): stop retrying.
@@ -300,7 +338,7 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !vm.ValidID(p.VMID) {
+		if !vm.ValidID(p.VMID) || vm.Reserved(p.VMID) {
 			return nil, fmt.Errorf("bad vm_id %q", p.VMID)
 		}
 		if p.Tunnel.Mode != "" && p.Tunnel.Mode != "self_register" {
@@ -345,9 +383,7 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 		return map[string]any{"vm_id": p.VMID, "deadline_at": p.DeadlineAt.UTC().Format(time.RFC3339)}, nil
 
 	case api.KindDrain:
-		if err := a.State.update(func(s *State) { s.Draining = true }); err != nil {
-			return nil, err
-		}
+		// The control plane stops placing rentals; running VMs are untouched.
 		return map[string]any{}, nil
 
 	case api.KindUpdateAgent:
@@ -360,6 +396,9 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 		}
 		if p.Version == a.Version {
 			return map[string]any{"version": a.Version}, nil
+		}
+		if newer, err := release.Newer(p.Version, a.Version); err != nil || !newer {
+			return nil, fmt.Errorf("refusing to replace %s with %s: not a newer release", a.Version, p.Version)
 		}
 		defer a.lock("host")()
 		if err := a.Update(ctx, p); err != nil {
@@ -426,7 +465,7 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	free := a.VMs.FreeGPUs(true)
 	sort.Ints(free)
 	var gpuErr string
-	var passed []int
+	var passed, failed []int
 	if len(free) > 0 {
 		out, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", free, vm.BenchScript, 30*time.Minute)
 		var vb vmBench
@@ -439,25 +478,39 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		if vb.Error != "" {
 			gpuErr = vb.Error
 		}
-		for i, idx := range free {
+		for idx, v := range a.matchGPUs(free, vb.GPUs) {
 			g := api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr}
-			if i < len(vb.GPUs) {
-				v := vb.GPUs[i]
+			if v != nil {
 				g = api.BenchmarkGPU{
 					Index: idx, Name: v.Name, UUID: v.UUID, VRAMGB: int(v.VRAMGB + 0.5), PCIeAddress: a.Host.GPUAddress(idx),
 					MemOK: v.MemOK, MemTestedGB: v.MemTestedGB, MatmulTFLOPSFP16: v.MatmulTFLOPSFP16, MatmulOK: v.MatmulOK,
-					NvidiaSMI: v.NvidiaSMI, Error: v.Error,
-				}
-				if v.MemOK && v.MatmulOK {
-					passed = append(passed, idx)
+					NvidiaSMI: clip(v.NvidiaSMI, smiCap(len(free))), Error: clip(v.Error, 500),
 				}
 			} else if gpuErr == "" {
 				g.Error = "gpu not visible inside the benchmark vm"
 			}
+			switch {
+			case g.MemOK && g.MatmulOK:
+				passed = append(passed, idx)
+			case gpuErr == "":
+				// The VM ran and this GPU failed its checks (not a boot or
+				// image problem, which says nothing about the GPU).
+				failed = append(failed, idx)
+			}
 			req.GPUs = append(req.GPUs, g)
 		}
+		sort.Slice(req.GPUs, func(i, j int) bool { return req.GPUs[i].Index < req.GPUs[j].Index })
+		learned := map[int]string{}
+		for _, g := range req.GPUs {
+			if g.UUID != "" && a.Host.GPUUUID(g.Index) == "" {
+				learned[g.Index] = g.UUID
+			}
+		}
+		if len(learned) > 0 {
+			a.Host.LearnUUIDs(learned)
+		}
 		if vb.Topo != "" {
-			topo.NVLinkMatrix = vb.Topo
+			topo.NVLinkMatrix = clip(vb.Topo, maxTopo)
 			if topo.Interconnect != "nvswitch" {
 				topo.Interconnect = interconnectFrom(vb.Topo)
 			}
@@ -466,8 +519,23 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	wg.Wait()
 	req.Disk, req.Net = disk, netb
 	req.Topology = topo
+	req.Disk.Error, req.Net.Error = clip(req.Disk.Error, 500), clip(req.Net.Error, 500)
+	// GPUs that fail stay out of rentals until a later benchmark passes.
+	a.VMs.Hold(failed)
 	a.VMs.ClearHold(passed)
-	resp, err := a.API.Benchmark(ctx, req)
+	var resp *api.BenchmarkResponse
+	var err error
+	for attempt := 1; ; attempt++ {
+		resp, err = a.API.Benchmark(ctx, req)
+		var he *api.HTTPError
+		if err == nil || errors.Is(err, api.ErrUnauthorized) || (errors.As(err, &he) && !he.Retryable()) || attempt == 5 || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(attempt*attempt) * 5 * time.Second):
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("post benchmark: %w", err)
 	}
@@ -480,6 +548,85 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		"net":      req.Net,
 		"error":    gpuErr,
 	}, nil
+}
+
+// Size caps keep a benchmark well under the control plane's 64 KiB body
+// limit: the nvidia-smi text shares 32 KiB across the GPUs.
+const (
+	maxSMIPerGPU = 4000
+	maxTopo      = 6000
+)
+
+func smiCap(gpus int) int {
+	if gpus <= 0 {
+		return maxSMIPerGPU
+	}
+	return min(maxSMIPerGPU, 32<<10/gpus)
+}
+
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+// matchGPUs pairs each benchmarked index with its result: by UUID when the
+// host knows it, otherwise by order (the VM sees the GPUs in index order),
+// but only when the VM saw exactly the GPUs it was given. Unmatched indexes
+// map to nil.
+func (a *Agent) matchGPUs(free []int, res []vmGPU) map[int]*vmGPU {
+	out := make(map[int]*vmGPU, len(free))
+	if len(res) != len(free) {
+		known := 0
+		for _, idx := range free {
+			if a.Host.GPUUUID(idx) != "" {
+				known++
+			}
+		}
+		if known != len(free) {
+			// Order says nothing when a GPU is missing: trust none.
+			for _, idx := range free {
+				out[idx] = nil
+			}
+			for _, idx := range free {
+				if u := a.Host.GPUUUID(idx); u != "" {
+					for i := range res {
+						if strings.EqualFold(res[i].UUID, u) {
+							out[idx] = &res[i]
+						}
+					}
+				}
+			}
+			return out
+		}
+	}
+	used := make([]bool, len(res))
+	for _, idx := range free {
+		out[idx] = nil
+		if u := a.Host.GPUUUID(idx); u != "" {
+			for i := range res {
+				if !used[i] && strings.EqualFold(res[i].UUID, u) {
+					out[idx], used[i] = &res[i], true
+					break
+				}
+			}
+		}
+	}
+	next := 0
+	for _, idx := range free {
+		if out[idx] != nil {
+			continue
+		}
+		for next < len(res) && used[next] {
+			next++
+		}
+		if next < len(res) {
+			out[idx], used[next] = &res[next], true
+			next++
+		}
+	}
+	return out
 }
 
 // interconnectFrom reads `nvidia-smi topo -m`: any NV# link means NVLink.

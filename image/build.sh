@@ -32,6 +32,12 @@ mkdir -p "$OUT"
 echo "==> Ubuntu 24.04 cloud image"
 curl -fsSL -o "$work/$BASE" "$BASE_URL/$BASE"
 curl -fsSL -o "$work/SHA256SUMS" "$BASE_URL/SHA256SUMS"
+if [ -f /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg ] && command -v gpgv >/dev/null; then
+	curl -fsSL -o "$work/SHA256SUMS.gpg" "$BASE_URL/SHA256SUMS.gpg"
+	gpgv --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg "$work/SHA256SUMS.gpg" "$work/SHA256SUMS"
+else
+	echo "warning: ubuntu-cloudimage-keyring not installed; SHA256SUMS signature not checked" >&2
+fi
 (cd "$work" && grep " \*$BASE\$" SHA256SUMS | sha256sum -c -)
 cp "$work/$BASE" "$work/build.qcow2"
 qemu-img resize -q "$work/build.qcow2" "$SIZE"
@@ -46,6 +52,40 @@ write_files:
   - path: /root/gpubench.cu
     encoding: b64
     content: $b64
+  - path: /usr/local/bin/runcrate-reclaim-watch
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Runcrate: copy the host's reclaim notice into /run/runcrate/reclaim-notice.json.
+      d=/run/runcrate
+      mkdir -p "\$d"
+      while :; do
+        if curl -fsS --max-time 3 -o "\$d/.reclaim-notice.part" http://169.254.169.254/runcrate/v1/reclaim-notice 2>/dev/null; then
+          mv -f "\$d/.reclaim-notice.part" "\$d/reclaim-notice.json"
+        else
+          rm -f "\$d/.reclaim-notice.part"
+        fi
+        sleep 5
+      done
+  - path: /usr/local/sbin/runcrate-has-nvswitch
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Exit 0 when the VM was given NVSwitches (Fabric Manager is needed).
+      lspci -nd 10de: | grep -q ' 0680:'
+  - path: /etc/systemd/system/runcrate-reclaim-watch.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Runcrate reclaim notice watcher
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      ExecStart=/usr/local/bin/runcrate-reclaim-watch
+      Restart=always
+      RestartSec=5
+      [Install]
+      WantedBy=multi-user.target
   - path: /root/provision.sh
     permissions: '0755'
     content: |
@@ -58,14 +98,32 @@ write_files:
       dpkg -i /tmp/cuda-keyring.deb
       apt-get update
       if [ -n "$DRIVER_BRANCH" ]; then apt-get install -y nvidia-open-$DRIVER_BRANCH; else apt-get install -y nvidia-open; fi
-      branch=\$(dpkg-query -W -f='\${Version}\n' nvidia-kernel-source-open 2>/dev/null | head -n1 | cut -d. -f1 || true)
-      [ -n "\$branch" ] || branch=\$(ls /usr/src | sed -n 's/^nvidia-\([0-9]*\)\..*/\1/p' | head -n1)
-      apt-get install -y nvidia-fabricmanager-\$branch || apt-get install -y nvidia-fabricmanager || true
+      dver=\$( (dpkg-query -W -f='\${Version}\n' nvidia-kernel-open-dkms nvidia-kernel-source-open 2>/dev/null || true) | grep -m1 . | sed 's/^[0-9]*://; s/-.*//' || true)
+      [ -n "\$dver" ] || { echo "driver version not found"; exit 1; }
+      echo "driver \$dver"
+      # Fabric Manager must match the driver exactly or it refuses to start.
+      fm=""
+      for pkg in nvidia-fabricmanager nvidia-fabricmanager-\${dver%%.*}; do
+        v=\$(apt-cache madison \$pkg 2>/dev/null | awk '{print \$3}' | grep -E "^([0-9]+:)?\$dver-" | head -n1 || true)
+        if [ -n "\$v" ]; then fm="\$pkg=\$v"; break; fi
+      done
+      [ -n "\$fm" ] || { echo "no Fabric Manager build for driver \$dver"; exit 1; }
+      apt-get install -y "\$fm"
+      # CUDA no newer than the driver: the newest when the driver is the
+      # newest, else the release that shipped with the pinned branch.
       cv="$CUDA_VERSION"
+      if [ -z "\$cv" ] && [ -n "$DRIVER_BRANCH" ]; then
+        case "$DRIVER_BRANCH" in 570) cv=12-8 ;; 575) cv=12-9 ;; 580) cv=13-0 ;; *) echo "set CUDA_VERSION for driver $DRIVER_BRANCH"; exit 1 ;; esac
+      fi
       [ -n "\$cv" ] || cv=\$(apt-cache search --names-only '^cuda-nvcc-[0-9]+-[0-9]+\$' | awk '{print \$1}' | sed 's/cuda-nvcc-//' | sort -V | tail -n1)
       apt-get install -y cuda-cudart-\$cv libcublas-\$cv cuda-nvcc-\$cv cuda-cudart-dev-\$cv libcublas-dev-\$cv
       cudadir=/usr/local/cuda-\$(echo \$cv | tr - .)
-      \$cudadir/bin/nvcc -O2 -o /usr/local/bin/rc-gpubench /root/gpubench.cu -lcublas
+      # Real code for every GPU generation we take (Turing to Blackwell),
+      # plus PTX for newer ones.
+      \$cudadir/bin/nvcc -O2 -o /usr/local/bin/rc-gpubench /root/gpubench.cu -lcublas \
+        -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+        -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 \
+        -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120
       apt-get purge -y cuda-nvcc-\$cv cuda-cudart-dev-\$cv libcublas-dev-\$cv
       apt-get autoremove -y
       ldd /usr/local/bin/rc-gpubench
@@ -75,8 +133,12 @@ write_files:
       dkms status
       ls /lib/modules/*/updates/dkms/nvidia.ko* || ls /lib/modules/*/kernel/drivers/video/nvidia* || true
       systemctl enable nvidia-persistenced || true
-      # Fabric Manager only matters on NVSwitch VMs; the benchmark starts it there.
-      systemctl disable nvidia-fabricmanager || true
+      # Fabric Manager runs only where there are NVSwitches (whole HGX nodes).
+      mkdir -p /etc/systemd/system/nvidia-fabricmanager.service.d
+      printf '[Service]\nExecCondition=/usr/local/sbin/runcrate-has-nvswitch\n' > /etc/systemd/system/nvidia-fabricmanager.service.d/runcrate.conf
+      systemctl enable nvidia-fabricmanager
+      # Spot reclaim notice: mirrored from the metadata server into a file.
+      systemctl enable runcrate-reclaim-watch.service
       # First-boot apt runs (the launch script) must not race unattended-upgrades.
       systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer || true
       apt-get purge -y unattended-upgrades || true
@@ -94,7 +156,7 @@ EOF
 printf 'instance-id: runcrate-image-build\nlocal-hostname: runcrate-image\n' > "$work/seed/meta-data"
 genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock "$work/seed/user-data" "$work/seed/meta-data"
 
-timeout 90m qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 8 -m 8G -nodefaults -display none \
+timeout 90m qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp "$(nproc)" -m 8G -nodefaults -display none \
 	-drive file="$work/build.qcow2",if=virtio,format=qcow2,discard=unmap \
 	-drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \

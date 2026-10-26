@@ -7,13 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
 	"github.com/runcrateai/runcrate-host/internal/bench"
 	"github.com/runcrateai/runcrate-host/internal/config"
+	"github.com/runcrateai/runcrate-host/internal/devmode"
 	"github.com/runcrateai/runcrate-host/internal/hw"
+	"github.com/runcrateai/runcrate-host/internal/sysexec"
+	"github.com/runcrateai/runcrate-host/internal/vm"
 )
 
 // gpuCacheFile holds what the host's NVIDIA driver said about each GPU before
@@ -79,6 +84,8 @@ func normalizeBusID(s string) string {
 
 // host implements agent.Host.
 type host struct {
+	mu         sync.Mutex
+	mgr        *vm.Manager
 	cfg        *config.Config
 	sys        hw.Sys
 	gpus       []hw.GPU
@@ -90,16 +97,65 @@ type host struct {
 
 func (h *host) HostID() string { return h.cfg.HostID }
 
+// GPUs reports every registered GPU; one that is gone from the bus is failed.
 func (h *host) GPUs() []api.GPUStatus {
-	out := make([]api.GPUStatus, 0, len(h.gpus))
+	present := map[int]hw.GPU{}
 	for _, g := range h.gpus {
-		health := h.sys.Health(g.Address)
-		if g.Blocker != "" {
-			health = "failed"
+		present[g.Index] = g
+	}
+	idx := make([]int, 0, len(h.cfg.GPUIndex))
+	for _, i := range h.cfg.GPUIndex {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	out := make([]api.GPUStatus, 0, len(idx))
+	for _, i := range idx {
+		g, ok := present[i]
+		health := "failed"
+		switch {
+		case !ok:
+		case devmode.NoPassthrough():
+			health = "ok"
+		case g.Blocker != "":
+		default:
+			health = h.sys.Health(g.Address)
 		}
-		out = append(out, api.GPUStatus{Index: g.Index, Health: health})
+		out = append(out, api.GPUStatus{Index: i, Health: health})
 	}
 	return out
+}
+
+func (h *host) GPUUUID(i int) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, g := range h.gpus {
+		if g.Index == i {
+			return g.UUID
+		}
+	}
+	return ""
+}
+
+// LearnUUIDs keeps UUIDs a benchmark saw, in memory, in the manager and in
+// the GPU cache, so later scrubs and benchmarks match GPUs exactly.
+func (h *host) LearnUUIDs(byIndex map[int]string) {
+	h.mu.Lock()
+	cache := loadGPUCache(h.cfg)
+	for i := range h.gpus {
+		if u, ok := byIndex[h.gpus[i].Index]; ok && h.gpus[i].UUID == "" {
+			h.gpus[i].UUID = u
+			c := cache.GPUs[h.gpus[i].Address]
+			c.UUID = u
+			cache.GPUs[h.gpus[i].Address] = c
+		}
+	}
+	h.mu.Unlock()
+	if h.mgr != nil {
+		h.mgr.SetUUIDs(byIndex)
+	}
+	if b, err := json.MarshalIndent(cache, "", "  "); err == nil {
+		_ = config.WriteFileAtomic(filepath.Join(h.cfg.DataDir, gpuCacheFile), b, 0o600)
+	}
 }
 
 func (h *host) GPUAddress(i int) string {
@@ -163,5 +219,34 @@ func (h *host) Peers(ctx context.Context, peers []api.Peer, topo api.Topology) [
 			rdma = true
 		}
 	}
-	return bench.Peers(ctx, h.cfg.HostID, topo.PrivateAddrs, peers, rdma)
+	return bench.Peers(ctx, h.cfg.HostID, topo.PrivateAddrs, peers, rdma, func(addrs []string) (func(), error) {
+		return h.openPeerPorts(ctx, addrs)
+	})
+}
+
+// openPeerPorts lets only the site's peers reach the benchmark ports while
+// the test runs; everything else is dropped.
+func (h *host) openPeerPorts(ctx context.Context, addrs []string) (func(), error) {
+	var ok []string
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			ok = append(ok, ip.String())
+		}
+	}
+	set := "elements = { " + strings.Join(ok, ", ") + " }"
+	if len(ok) == 0 {
+		set = ""
+	}
+	rules := "table inet runcrate_host_bench\ndelete table inet runcrate_host_bench\ntable inet runcrate_host_bench {\n" +
+		"\tset peers { type ipv4_addr; " + set + " }\n" +
+		"\tchain input { type filter hook input priority filter - 5; policy accept;\n" +
+		"\t\ttcp dport { 5201, 18600-18999 } ip saddr != @peers drop\n" +
+		"\t\ttcp dport { 5201, 18600-18999 } meta nfproto ipv6 drop\n\t}\n}\n"
+	run := sysexec.Exec{}
+	if _, err := run.RunInput(ctx, []byte(rules), "nft", "-f", "-"); err != nil {
+		return nil, err
+	}
+	return func() {
+		_, _ = run.Run(context.WithoutCancel(ctx), "nft", "delete", "table", "inet", "runcrate_host_bench")
+	}, nil
 }

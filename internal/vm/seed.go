@@ -1,11 +1,8 @@
 package vm
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"mime/multipart"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,95 +10,19 @@ import (
 	"github.com/runcrateai/runcrate-host/internal/sysexec"
 )
 
-// reclaimWatch runs inside every VM: it copies the host's reclaim notice to
-// /run/runcrate/reclaim-notice.json, so jobs can watch a file as well as the
-// metadata endpoint.
-const reclaimWatch = `#!/bin/sh
-# Runcrate: mirror the reclaim notice from the metadata server into a file.
-d=/run/runcrate
-mkdir -p "$d"
-while :; do
-  if curl -fsS --max-time 3 -o "$d/.reclaim-notice.part" http://169.254.169.254/runcrate/v1/reclaim-notice 2>/dev/null; then
-    mv -f "$d/.reclaim-notice.part" "$d/reclaim-notice.json"
-  else
-    rm -f "$d/.reclaim-notice.part"
-  fi
-  sleep 5
-done
-`
-
-const reclaimUnit = `[Unit]
-Description=Runcrate reclaim notice watcher
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/runcrate-reclaim-watch
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-`
-
-// hostConfig is our own cloud-config part. It only writes files and enables
-// a unit in bootcmd: the customer's launch script disables cloud-init and
-// masks cloud-final once it runs, so nothing of ours may depend on the final
-// stage.
-func hostConfig() string {
-	indent := func(s string) string {
-		return "      " + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n      ") + "\n"
-	}
-	return "#cloud-config\n" +
-		"datasource_list: [NoCloud, None]\n" +
-		"write_files:\n" +
-		"  - path: /usr/local/bin/runcrate-reclaim-watch\n" +
-		"    permissions: '0755'\n" +
-		"    content: |\n" + indent(reclaimWatch) +
-		"  - path: /etc/systemd/system/runcrate-reclaim-watch.service\n" +
-		"    permissions: '0644'\n" +
-		"    content: |\n" + indent(reclaimUnit) +
-		"bootcmd:\n" +
-		"  - [systemctl, daemon-reload]\n" +
-		"  - [systemctl, enable, --now, --no-block, runcrate-reclaim-watch.service]\n"
-}
-
-// UserData builds the multipart user-data: our cloud-config, then the
-// customer's launch script verbatim (a shell script, or cloud-config if the
-// control plane ever sends one).
+// UserData is the customer's launch script, verbatim: a shell script or
+// cloud-config. Everything of ours (reclaim watcher, datasource, driver)
+// is in the image, because the launch script disables cloud-init after its
+// first run.
 func UserData(customer string) ([]byte, error) {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fmt.Fprintf(&buf, "Content-Type: multipart/mixed; boundary=\"%s\"\nMIME-Version: 1.0\n\n", mw.Boundary())
-	add := func(ctype, name, body string) error {
-		h := textproto.MIMEHeader{}
-		h.Set("Content-Type", ctype+`; charset="utf-8"`)
-		h.Set("MIME-Version", "1.0")
-		h.Set("Content-Transfer-Encoding", "8bit")
-		h.Set("Content-Disposition", `attachment; filename="`+name+`"`)
-		w, err := mw.CreatePart(h)
-		if err != nil {
-			return err
-		}
-		_, err = w.Write([]byte(body))
-		return err
+	c := strings.TrimSpace(customer)
+	if c == "" {
+		return []byte("#cloud-config\n{}\n"), nil
 	}
-	if err := add("text/cloud-config", "runcrate-host.yaml", hostConfig()); err != nil {
-		return nil, err
+	if !strings.HasPrefix(c, "#!") && !strings.HasPrefix(c, "#cloud-config") {
+		return nil, fmt.Errorf("cloud_init must be a #! script or #cloud-config")
 	}
-	if c := strings.TrimSpace(customer); c != "" {
-		ctype := "text/x-shellscript"
-		if strings.HasPrefix(c, "#cloud-config") {
-			ctype = "text/cloud-config"
-		} else if !strings.HasPrefix(c, "#!") {
-			return nil, fmt.Errorf("cloud_init must be a #! script or #cloud-config")
-		}
-		if err := add(ctype, "launch", customer); err != nil {
-			return nil, err
-		}
-	}
-	if err := mw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return []byte(customer), nil
 }
 
 // MetaData is the NoCloud meta-data.
@@ -150,8 +71,14 @@ func WriteSeed(ctx context.Context, run sysexec.Runner, dir string, userData []b
 	if err != nil {
 		return "", err
 	}
-	// The seed holds the customer's launch script (with its machine token);
-	// keep only the ISO, root-only.
+	// The seed holds the customer's launch script (with its machine token):
+	// overwrite the plain copies, keep only the ISO.
+	for name := range files {
+		p := filepath.Join(src, name)
+		if fi, err := os.Stat(p); err == nil {
+			_ = os.WriteFile(p, make([]byte, fi.Size()), 0o600)
+		}
+	}
 	_ = os.RemoveAll(src)
 	return iso, os.Chmod(iso, 0o600)
 }

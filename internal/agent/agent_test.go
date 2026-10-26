@@ -177,6 +177,14 @@ func (v *fakeVMs) ClearHold(g []int) {
 	v.cleared = append(v.cleared, g...)
 }
 
+func (v *fakeVMs) Hold(g []int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, i := range g {
+		v.held[i] = true
+	}
+}
+
 func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -189,8 +197,10 @@ type fakeHost struct{}
 func (fakeHost) GPUs() []api.GPUStatus {
 	return []api.GPUStatus{{Index: 0, Health: "ok"}, {Index: 1, Health: "ok"}}
 }
-func (fakeHost) GPUAddress(i int) string { return "0000:4" + strconv.Itoa(i) + ":00.0" }
-func (fakeHost) Load() api.Load          { return api.Load{Load1: 0.5, MemTotalGB: 512} }
+func (fakeHost) GPUAddress(i int) string   { return "0000:4" + strconv.Itoa(i) + ":00.0" }
+func (fakeHost) GPUUUID(i int) string      { return "" }
+func (fakeHost) LearnUUIDs(map[int]string) {}
+func (fakeHost) Load() api.Load            { return api.Load{Load1: 0.5, MemTotalGB: 512} }
 func (fakeHost) Topology() api.Topology {
 	return api.Topology{GPUsPerNode: 2, Interconnect: "unknown", PartialVMOK: true}
 }
@@ -332,7 +342,7 @@ func TestDestroyReclaimDrain(t *testing.T) {
 	}
 	_ = a.Tick(context.Background())
 	last := cp.heartbeats[len(cp.heartbeats)-1]
-	if !last.Load.Draining || len(last.VMs) != 0 {
+	if len(last.VMs) != 0 {
 		t.Fatalf("heartbeat after drain/destroy = %+v", last)
 	}
 }
@@ -357,9 +367,6 @@ func TestResultRetriedAfterControlPlaneError(t *testing.T) {
 	tickUntil(t, a2, func() bool { return len(cp.resultsFor(20)) > 0 })
 	if got := len(cp.resultsFor(20)); got != 1 {
 		t.Fatalf("result posted %d times", got)
-	}
-	if !a2.State.Draining {
-		t.Fatal("drain was lost")
 	}
 }
 
@@ -398,6 +405,7 @@ func TestUnauthorizedStopsTheLoop(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.revoked = true
 	a := newAgent(t, cp, newFakeVMs(), filepath.Join(t.TempDir(), "state.json"))
+	a.UnauthorizedGrace = time.Nanosecond
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := a.Run(ctx); !errors.Is(err, api.ErrUnauthorized) {
@@ -432,6 +440,9 @@ func TestBenchmarkMapsGPUsAndPosts(t *testing.T) {
 	if len(vms.cleared) != 1 || vms.cleared[0] != 0 {
 		t.Fatalf("only the passing GPU may be cleared: %v", vms.cleared)
 	}
+	if !vms.held[1] || vms.held[0] {
+		t.Fatalf("the failing GPU must be held: %v", vms.held)
+	}
 	if r := cp.resultsFor(40)[0]; r.Status != "done" || r.Result.(map[string]any)["verified"] != true {
 		t.Fatalf("result = %+v", r)
 	}
@@ -448,5 +459,24 @@ func TestHeldGPUReportsDegraded(t *testing.T) {
 	g := cp.heartbeats[0].GPUs
 	if g[0].Health != "ok" || g[1].Health != "degraded" || g[1].TempC != nil {
 		t.Fatalf("gpus = %+v", g)
+	}
+}
+
+func TestBenchmarkWithAMissingGPUTrustsNoPosition(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	// Two GPUs given, one seen: without UUIDs nobody knows which one failed.
+	vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(41, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(41)) > 0 })
+	b := cp.benchmarks[0]
+	for _, g := range b.GPUs {
+		if g.MemOK || g.MatmulOK || g.UUID != "" {
+			t.Fatalf("a result was pinned to a GPU by position: %+v", g)
+		}
+	}
+	if len(vms.cleared) != 0 || !vms.held[0] || !vms.held[1] {
+		t.Fatalf("cleared %v held %v", vms.cleared, vms.held)
 	}
 }

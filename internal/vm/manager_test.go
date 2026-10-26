@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
-	"mime/multipart"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -90,6 +88,10 @@ func (f *fakeHost) startedIDs() []string {
 
 type fakeImages struct{ path string }
 
+func (f fakeImages) Local(ctx context.Context, v string) (string, string, error) {
+	return f.Ensure(ctx, v)
+}
+
 func (f fakeImages) Ensure(ctx context.Context, v string) (string, string, error) {
 	if v == "" {
 		v = "v1"
@@ -115,6 +117,7 @@ func newFixture(t *testing.T) *fixture {
 				t.Fatal(err)
 			}
 			_ = os.Symlink(filepath.Join(root, "sys/bus/pci/drivers/vfio-pci"), filepath.Join(d, "driver"))
+			_ = os.Symlink(filepath.Join(root, "sys/kernel/iommu_groups", fmt.Sprint(20+i)), filepath.Join(d, "iommu_group"))
 			_ = os.WriteFile(filepath.Join(d, "resource"), []byte(fmt.Sprintf("0x%x 0x%x 0x14220c\n", 0x200000000000+i*0x10000000000, 0x200000000000+i*0x10000000000+0x1fffffffff)), 0o644)
 		}
 	}
@@ -124,8 +127,9 @@ func newFixture(t *testing.T) *fixture {
 	}
 	_, subnet, _ := net.ParseCIDR("10.254.0.0/16")
 	host := &fakeHost{units: map[string]string{}}
-	img := filepath.Join(root, "base.qcow2")
-	_ = os.WriteFile(img, []byte("base"), 0o400)
+	img := filepath.Join(root, "data/images/v1.qcow2")
+	_ = os.MkdirAll(filepath.Dir(img), 0o711)
+	_ = os.WriteFile(img, []byte("base"), 0o444)
 	vars := filepath.Join(root, "OVMF_VARS.fd")
 	_ = os.WriteFile(vars, []byte("vars"), 0o644)
 	m := &Manager{
@@ -236,7 +240,7 @@ func TestGuestPowerOffShowsStopped(t *testing.T) {
 func TestDestroyWipesAndScrubsBeforeReuse(t *testing.T) {
 	f := newFixture(t)
 	f.m.Scrub = true
-	f.answerEphemeral(`{"ok":true,"mode":"scrub"}`)
+	f.answerEphemeral(`{"ok":true,"mode":"scrub","gpus":[{"uuid":"GPU-a","ok":true}]}`)
 	for _, id := range []string{"vm-a", "vm-b", "scrub-vm-a"} {
 		f.prepTap(t, id)
 	}
@@ -263,9 +267,8 @@ func TestDestroyWipesAndScrubsBeforeReuse(t *testing.T) {
 	}
 	f.m.Wait()
 	started := f.host.startedIDs()
-	want := []string{"vm-a", "scrub-vm-a", "vm-b"}
-	if strings.Join(started, ",") != strings.Join(want, ",") {
-		t.Fatalf("start order = %v, want %v", started, want)
+	if len(started) != 3 || started[0] != "vm-a" || !strings.HasPrefix(started[1], "scrub-") || started[2] != "vm-b" {
+		t.Fatalf("start order = %v, want vm-a, a scrub, then vm-b", started)
 	}
 	if _, err := os.Stat(f.m.scrubMarker("vm-a")); !os.IsNotExist(err) {
 		t.Fatal("scrub marker left behind")
@@ -275,7 +278,7 @@ func TestDestroyWipesAndScrubsBeforeReuse(t *testing.T) {
 func TestFailedScrubHoldsTheGPU(t *testing.T) {
 	f := newFixture(t)
 	f.m.Scrub = true
-	f.answerEphemeral(`{"ok":false,"error":"12 words read back wrong"}`)
+	f.answerEphemeral(`{"ok":false,"error":"12 words read back wrong","gpus":[{"uuid":"GPU-a","ok":false}]}`)
 	for _, id := range []string{"vm-a", "vm-b", "scrub-vm-a"} {
 		f.prepTap(t, id)
 	}
@@ -308,6 +311,7 @@ func TestNVSwitchNodeIsRentedWhole(t *testing.T) {
 	d := filepath.Join(f.root, "sys/bus/pci/devices/0000:a0:00.0")
 	_ = os.MkdirAll(d, 0o755)
 	_ = os.Symlink(filepath.Join(f.root, "sys/bus/pci/drivers/vfio-pci"), filepath.Join(d, "driver"))
+	_ = os.Symlink(filepath.Join(f.root, "sys/kernel/iommu_groups/90"), filepath.Join(d, "iommu_group"))
 	f.prepTap(t, "vm-a")
 	ctx := context.Background()
 	if _, err := f.m.Create(ctx, spec("vm-a", 0)); err == nil {
@@ -396,36 +400,8 @@ func TestLoadResumesRunningAndDropsHalfMade(t *testing.T) {
 func TestUserDataKeepsTheLaunchScriptVerbatim(t *testing.T) {
 	script := "#!/bin/bash\nset -e\necho 'runcrate launch'\n"
 	ud, err := UserData(script)
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, body, _ := strings.Cut(string(ud), "\n\n")
-	_, params, err := mime.ParseMediaType(strings.TrimPrefix(strings.Split(head, "\n")[0], "Content-Type: "))
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := multipart.NewReader(strings.NewReader(body), params["boundary"])
-	var types, bodies []string
-	for {
-		p, err := r.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, _ := io.ReadAll(p)
-		types = append(types, strings.Split(p.Header.Get("Content-Type"), ";")[0])
-		bodies = append(bodies, string(b))
-	}
-	if strings.Join(types, ",") != "text/cloud-config,text/x-shellscript" {
-		t.Fatalf("parts = %v", types)
-	}
-	if bodies[1] != script {
-		t.Fatalf("launch script changed:\n%q", bodies[1])
-	}
-	if !strings.Contains(bodies[0], "runcrate-reclaim-watch") || strings.Contains(bodies[0], "runcmd") {
-		t.Fatalf("host config must use bootcmd, not the final stage the launch script masks:\n%s", bodies[0])
+	if err != nil || string(ud) != script {
+		t.Fatalf("UserData = %q, %v", ud, err)
 	}
 	if _, err := UserData("echo no shebang"); err == nil {
 		t.Fatal("a launch script without #! was accepted")
@@ -435,14 +411,18 @@ func TestUserDataKeepsTheLaunchScriptVerbatim(t *testing.T) {
 func TestRulesetIsolatesVMs(t *testing.T) {
 	_, subnet, _ := net.ParseCIDR("10.254.0.0/16")
 	n := &Network{Subnet: subnet}
-	rs := n.Ruleset()
+	rs := n.Ruleset([]string{"203.0.113.0/26", "198.51.100.1/32"})
 	for _, want := range []string{
-		`iifname "rc-*" oifname "rc-*" drop`,     // VM to VM
-		`iifname "rc-*" ip daddr @blocked4 drop`, // VM to private networks
-		`iifname "rc-*" drop`,                    // VM to host
+		`iifname "rc-*" oifname "rc-*" drop`, // VM to VM
+		`iifname "rc-*" ip daddr @bogons4 drop`,
+		`iifname "rc-*" ip daddr @partner4 drop`,
+		`elements = { 203.0.113.0/26, 198.51.100.1/32 }`,
+		`fib saddr . iif oif missing drop`,
+		`ip saddr != 10.254.0.0/16 drop`,
+		`iifname "rc-*" drop`, // VM to host
 		`oifname "rc-*" ct state established,related accept`,
 		`oifname "rc-*" drop`, // nothing new into a VM
-		`redirect to :16925`,  // metadata
+		`redirect to :980`,    // metadata
 		`"192.168.0.0/16"`, `10.0.0.0/8`, `172.16.0.0/12`, `169.254.0.0/16`, `100.64.0.0/10`,
 		`ip saddr 10.254.0.0/16 oifname != "rc-*" masquerade`,
 	} {
@@ -454,7 +434,7 @@ func TestRulesetIsolatesVMs(t *testing.T) {
 		t.Fatal("forward guard present although forwarding was on")
 	}
 	n.ForwardWasOff = true
-	if !strings.Contains(n.Ruleset(), "\t\tdrop\n\t}\n\tchain postrouting") {
+	if !strings.Contains(n.Ruleset(nil), "\t\tdrop\n\t}\n\tchain postrouting") {
 		t.Fatal("forward guard missing although forwarding was off before install")
 	}
 	h, g, _ := n.Slot(3)

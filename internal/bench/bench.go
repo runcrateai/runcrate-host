@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -173,8 +174,12 @@ func parallel(n int, fn func() (int64, error)) (float64, error) {
 	return float64(total) * 8 / 1e6 / sec, nil
 }
 
-// PeerWindow is how long a host serves iperf3 during its benchmark.
-const PeerWindow = 5 * time.Minute
+// PeerWindow bounds the whole peer test; PeerServe is how long a host keeps
+// serving for peers that dial it.
+const (
+	PeerWindow = 5 * time.Minute
+	PeerServe  = 3 * time.Minute
+)
 
 // ibPort derives a per-pair port, so a host with several lower peers can
 // serve each one its own ib_write_bw.
@@ -188,7 +193,11 @@ func ibPort(server, client string) int {
 // its private addresses for PeerWindow; the host with the lower id dials each
 // higher one, so each pair is measured once. Missing tools or a closed
 // private network give a result with an error, never a failure.
-func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer, rdma bool) []api.PeerResult {
+//
+// guard (may be nil) opens the test ports to the peers' addresses only for
+// the window and returns the function that closes them again. The servers
+// run as nobody.
+func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer, rdma bool, guard func(peerAddrs []string) (func(), error)) []api.PeerResult {
 	if len(peers) == 0 {
 		return nil
 	}
@@ -202,9 +211,28 @@ func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer,
 	}
 	ctx, cancel := context.WithTimeout(ctx, PeerWindow)
 	defer cancel()
+	if guard != nil {
+		var addrs []string
+		for _, p := range peers {
+			addrs = append(addrs, p.PrivateAddrs...)
+		}
+		closePorts, err := guard(addrs)
+		if err != nil {
+			var out []api.PeerResult
+			for _, p := range peers {
+				out = append(out, api.PeerResult{HostID: p.HostID, Error: "could not limit the test ports to peers: " + err.Error()})
+			}
+			return out
+		}
+		defer closePorts()
+	}
+	nobody := func(cmd *exec.Cmd) *exec.Cmd {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
+		return cmd
+	}
 	var servers []*exec.Cmd
 	for _, a := range myAddrs {
-		cmd := exec.CommandContext(ctx, iperf, "-s", "-B", a, "-p", "5201")
+		cmd := nobody(exec.CommandContext(ctx, iperf, "-s", "-B", a, "-p", "5201"))
 		if cmd.Start() == nil {
 			servers = append(servers, cmd)
 		}
@@ -212,7 +240,7 @@ func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer,
 	if rdma {
 		for _, p := range peers {
 			if p.HostID < self {
-				cmd := exec.CommandContext(ctx, "ib_write_bw", "-p", strconv.Itoa(ibPort(self, p.HostID)), "-F", "--report_gbits", "-D", "5")
+				cmd := nobody(exec.CommandContext(ctx, "ib_write_bw", "-p", strconv.Itoa(ibPort(self, p.HostID)), "-F", "--report_gbits", "-D", "5"))
 				if cmd.Start() == nil {
 					servers = append(servers, cmd)
 				}
@@ -226,9 +254,12 @@ func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer,
 		}
 		out = append(out, measure(ctx, iperf, self, p, rdma))
 	}
-	// Stay up for the higher-id peers that dial us.
+	// Stay up a while for the lower-id peers that dial us.
 	if hasLower(self, peers) {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-time.After(PeerServe):
+		}
 	}
 	for _, s := range servers {
 		_ = s.Process.Kill()

@@ -13,11 +13,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
@@ -41,13 +44,33 @@ const (
 const (
 	reserveThreads = 2
 	reserveRAMGB   = 8
-	reserveDiskGB  = 10
+	reserveDiskGB  = ReserveDiskGB
+	// ReserveDiskGB is disk the agent never gives to VMs.
+	ReserveDiskGB = 10
+	// ImageAllowanceGB is room kept for base images when reporting disk.
+	ImageAllowanceGB = 20
 )
 
 var idRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
 
 // ValidID reports whether a VM id is safe to use in paths and unit names.
 func ValidID(id string) bool { return idRe.MatchString(id) }
+
+// Reserved reports ids kept for the agent's own throwaway VMs.
+func Reserved(id string) bool {
+	return strings.HasPrefix(id, "scrub-") || strings.HasPrefix(id, "bench-")
+}
+
+// SetUUIDs records GPU UUIDs (learned from a benchmark).
+func (m *Manager) SetUUIDs(byIndex map[int]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.GPUs {
+		if u, ok := byIndex[m.GPUs[i].Index]; ok && m.GPUs[i].UUID == "" {
+			m.GPUs[i].UUID = u
+		}
+	}
+}
 
 // Spec is what to run.
 type Spec struct {
@@ -78,11 +101,19 @@ type Record struct {
 	CreatedAt   time.Time `json:"created_at"`
 	// Want is false once a destroy started; a restart then finishes it.
 	Want bool `json:"want"`
+	// Started is set once QEMU was launched with the GPUs, so a VM that
+	// never ran needs no GPU scrub.
+	Started bool `json:"started,omitempty"`
+	// Base is the image the disk is layered on. QEMU gets it explicitly; the
+	// overlay's own header is never trusted for it.
+	Base string `json:"base"`
 }
 
 // Images provides base images by version ("" = current).
 type Images interface {
 	Ensure(ctx context.Context, version string) (path, version2 string, err error)
+	// Local is Ensure that prefers the newest image already on disk.
+	Local(ctx context.Context, version string) (path, version2 string, err error)
 }
 
 // Manager owns every VM on the host.
@@ -106,8 +137,14 @@ type Manager struct {
 	// Scrub runs a throwaway VM that overwrites GPU memory after each
 	// customer VM.
 	Scrub bool
-	// Started reports whether a VM's unit is up; replaceable in tests.
+	// BootWait is how long a new QEMU must stay up to count as started.
 	BootWait time.Duration
+	// NoPassthrough (devmode only) boots VMs without their GPUs.
+	NoPassthrough bool
+	// QemuUser runs QEMU unprivileged and confined ("" only in tests).
+	QemuUser string
+	// Ctx bounds background scrubs; cancel it at shutdown.
+	Ctx context.Context
 
 	mu      sync.Mutex
 	vms     map[string]*Record
@@ -150,19 +187,34 @@ func (m *Manager) save(r *Record) error {
 
 // Load reads persisted VMs. With resume, the host is brought back to them:
 // VMs that should run are started again (after a host reboot), half-finished
-// destroys, creates and throwaway VMs are cleaned up, and pending scrubs and
-// wipes finish. Without resume (uninstall) it only reads the records.
+// destroys, creates and throwaway VMs are cleaned up, held GPUs stay held,
+// and pending scrubs and wipes finish. Without resume (uninstall) it only
+// reads the records.
 func (m *Manager) Load(ctx context.Context, resume bool) error {
 	m.mu.Lock()
 	m.init()
 	m.mu.Unlock()
-	if err := os.MkdirAll(filepath.Join(m.DataDir, "vms"), 0o700); err != nil {
-		return err
+	for _, d := range []string{m.DataDir, filepath.Join(m.DataDir, "vms")} {
+		// 0711: an unprivileged QEMU may pass through to its own VM dir.
+		if err := os.MkdirAll(d, 0o711); err != nil {
+			return err
+		}
+		_ = os.Chmod(d, 0o711)
+	}
+	for _, g := range m.heldFromDisk() {
+		m.mu.Lock()
+		m.scrubOK[g] = false
+		m.mu.Unlock()
 	}
 	ents, err := os.ReadDir(filepath.Join(m.DataDir, "vms"))
 	if err != nil {
 		return err
 	}
+	type pending struct {
+		id   string
+		gpus []int
+	}
+	var scrubs []pending
 	for _, e := range ents {
 		if !resume && strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -170,7 +222,14 @@ func (m *Manager) Load(ctx context.Context, resume bool) error {
 		if id, ok := strings.CutPrefix(e.Name(), ".scrub-"); ok {
 			var gpus []int
 			if b, err := os.ReadFile(filepath.Join(m.DataDir, "vms", e.Name())); err == nil && json.Unmarshal(b, &gpus) == nil {
-				defer m.startScrub(ctx, id, gpus)
+				// Hold the GPUs now, before any create_vm can take them.
+				m.mu.Lock()
+				for _, g := range gpus {
+					m.busy[g] = "scrub:" + id
+					m.scrubOK[g] = false
+				}
+				m.mu.Unlock()
+				scrubs = append(scrubs, pending{id, gpus})
 			}
 			continue
 		}
@@ -213,7 +272,25 @@ func (m *Manager) Load(ctx context.Context, resume bool) error {
 			}
 		}
 	}
+	for _, p := range scrubs {
+		m.startScrub(p.id, p.gpus)
+	}
 	return nil
+}
+
+func (m *Manager) holdPath(g int) string {
+	return filepath.Join(m.DataDir, "holds", strconv.Itoa(g))
+}
+
+func (m *Manager) heldFromDisk() []int {
+	ents, _ := os.ReadDir(filepath.Join(m.DataDir, "holds"))
+	var out []int
+	for _, e := range ents {
+		if g, err := strconv.Atoi(e.Name()); err == nil {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 func (m *Manager) setState(r *Record, state, msg string) {
@@ -244,15 +321,17 @@ func (m *Manager) List(ctx context.Context) []api.VMStatus {
 		state := r.State
 		m.mu.Unlock()
 		if state == StateRunning {
-			switch m.unitState(ctx, r.ID) {
-			case "active", "activating", "reloading":
+			switch m.unitState(context.WithoutCancel(ctx), r.ID) {
 			case "failed":
 				m.setState(r, StateFailed, "qemu exited with an error")
 				state = StateFailed
-			default:
+			case "inactive":
 				// The guest powered itself off.
 				m.setState(r, StateStopped, "")
 				state = StateStopped
+			default:
+				// Up, or systemd didn't answer: keep the state, look again
+				// next time.
 			}
 		}
 		out = append(out, api.VMStatus{VMID: r.ID, State: state, GPUIndexes: append([]int{}, r.GPUIndexes...)})
@@ -329,7 +408,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		if !ok {
 			return nil, false, fmt.Errorf("gpu index %d is not on this host", g)
 		}
-		if gpu.Blocker != "" {
+		if gpu.Blocker != "" && !m.NoPassthrough {
 			return nil, false, fmt.Errorf("gpu %d can't be passed through: %s", g, gpu.Blocker)
 		}
 		if seen[g] {
@@ -350,7 +429,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		blocked := ""
 		for _, g := range s.GPUIndexes {
 			if who, ok := m.busy[g]; ok && (s.Owner == "" || who != s.Owner) {
-				if !strings.HasPrefix(who, "scrub:") {
+				if !strings.HasPrefix(who, "scrub:") && !strings.HasPrefix(who, "destroying:") {
 					m.mu.Unlock()
 					return nil, false, fmt.Errorf("gpu %d is in use by vm %s", g, who)
 				}
@@ -390,8 +469,20 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 	if m.HostRAMGB > 0 && usedRAM+s.RAMGB > m.HostRAMGB-reserveRAMGB {
 		return nil, false, fmt.Errorf("%w: %d GB RAM asked, %d free", ErrCapacity, s.RAMGB, m.HostRAMGB-reserveRAMGB-usedRAM)
 	}
-	if free, _ := hw.DiskFree(m.DataDir); free > 0 && uint64(s.DiskGB+reserveDiskGB)<<30 > free {
-		return nil, false, fmt.Errorf("%w: %d GB disk asked, %d GB free", ErrCapacity, s.DiskGB, free>>30)
+	// VM disks are thin: count what every VM may still grow into, not only
+	// what the filesystem has free now.
+	if free, _ := hw.DiskFree(m.DataDir); free > 0 {
+		var committed, written uint64
+		for _, r := range m.vms {
+			committed += uint64(r.DiskGB) << 30
+			written += allocated(filepath.Join(m.dir(r.ID), "disk.qcow2"))
+		}
+		capacity := free + written
+		need := committed + uint64(s.DiskGB+reserveDiskGB)<<30
+		if need > capacity {
+			left := int64(capacity>>30) - int64(committed>>30) - reserveDiskGB
+			return nil, false, fmt.Errorf("%w: %d GB disk asked, %d GB left", ErrCapacity, s.DiskGB, max(left, 0))
+		}
 	}
 	slot := -1
 	for i := 0; i < m.Net.MaxSlots(); i++ {
@@ -414,14 +505,20 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 	r := &Record{Spec: s, Slot: slot, Tap: tap, MAC: macFor(s.ID), GuestIP: guest.String(), State: StateCreating, CreatedAt: time.Now().UTC(), Want: true}
 	for _, g := range s.GPUIndexes {
 		gpu, _ := m.gpu(g)
-		r.PassThrough = append(r.PassThrough, gpu.Address)
+		if !m.NoPassthrough {
+			r.PassThrough = append(r.PassThrough, gpu.Address)
+		}
 	}
-	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) == len(m.GPUs) {
+	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) == len(m.GPUs) && !m.NoPassthrough {
 		r.PassThrough = append(r.PassThrough, m.NVSwitches...)
 	}
 	m.vms[s.ID] = r
 	for _, g := range s.GPUIndexes {
-		m.busy[g] = s.ID
+		if s.Owner != "" {
+			m.busy[g] = s.Owner // a scrub keeps holding them as itself
+		} else {
+			m.busy[g] = s.ID
+		}
 	}
 	return r, false, nil
 }
@@ -469,11 +566,17 @@ func (m *Manager) prepare(ctx context.Context, r *Record) error {
 	if err := m.save(r); err != nil {
 		return err
 	}
-	base, version, err := m.Images.Ensure(ctx, r.ImageVersion)
+	ensure := m.Images.Ensure
+	if r.Ephemeral {
+		// Throwaway VMs use whatever image is already here; only a host with
+		// none asks the API.
+		ensure = m.Images.Local
+	}
+	base, version, err := ensure(ctx, r.ImageVersion)
 	if err != nil {
 		return fmt.Errorf("image: %w", err)
 	}
-	r.ImageVersion = version
+	r.ImageVersion, r.Base = version, base
 	disk := filepath.Join(dir, "disk.qcow2")
 	args := []string{"create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", base, disk}
 	if r.DiskGB > 0 {
@@ -507,11 +610,19 @@ func (m *Manager) prepare(ctx context.Context, r *Record) error {
 
 // start brings up networking, GPUs and the QEMU unit for a prepared VM.
 func (m *Manager) start(ctx context.Context, r *Record) error {
-	if err := m.Net.AddTap(ctx, r.Tap, r.Slot); err != nil {
+	if st := m.unitState(ctx, r.ID); st == "active" || st == "activating" {
+		// Already running (agent restart): only the metadata entry is new.
+		m.Meta.Set(r.GuestIP, &metadata.Entry{VMID: r.ID, Ephemeral: r.Ephemeral, Reclaim: r.Reclaim})
+		return nil
+	}
+	if err := m.Net.AddTap(ctx, r.Tap, r.Slot, m.QemuUser); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
 	m.Meta.Set(r.GuestIP, &metadata.Entry{VMID: r.ID, Ephemeral: r.Ephemeral, Reclaim: r.Reclaim})
 	for _, g := range r.GPUIndexes {
+		if m.NoPassthrough {
+			break
+		}
 		gpu, _ := m.gpu(g)
 		for _, a := range append([]string{gpu.Address}, gpu.Companions...) {
 			if err := m.VFIO.Bind(a); err != nil {
@@ -526,22 +637,38 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 			}
 		}
 	}
-	if st := m.unitState(ctx, r.ID); st == "active" || st == "activating" {
-		return nil
+	groups, err := m.groupDevices(r.PassThrough)
+	if err != nil {
+		return err
+	}
+	if err := m.giveToQemu(r, groups); err != nil {
+		return err
 	}
 	_, _ = m.Run.Run(ctx, "systemctl", "reset-failed", unit(r.ID))
+	dir := m.dir(r.ID)
 	spec := QemuSpec{
-		Name: r.ID, Dir: m.dir(r.ID), VCPUs: r.VCPUs, RAMGB: r.RAMGB,
-		Disk: filepath.Join(m.dir(r.ID), "disk.qcow2"), Seed: filepath.Join(m.dir(r.ID), "seed.iso"),
+		Name: r.ID, Dir: dir, VCPUs: r.VCPUs, RAMGB: r.RAMGB,
+		Disk: filepath.Join(dir, "disk.qcow2"), Base: r.Base, Seed: filepath.Join(dir, "seed.iso"),
 		Tap: r.Tap, MAC: r.MAC, Firmware: m.Firmware, PassThrough: r.PassThrough,
 		MMIO64MB: MMIO64For(m.Sys.Root, r.PassThrough),
 	}
-	args := append([]string{
+	if filepath.Dir(spec.Base) != filepath.Join(m.DataDir, "images") {
+		return fmt.Errorf("vm %s has no valid base image (%q)", r.ID, spec.Base)
+	}
+	args := []string{
 		"--unit=" + unit(r.ID), "--slice=runcrate.slice", "--description=Runcrate VM " + r.ID,
 		"--property=KillMode=mixed", "--property=TimeoutStopSec=30", "--property=LimitMEMLOCK=infinity",
-		"--property=Restart=no", "--", "qemu-system-x86_64",
-	}, spec.Args()...)
-	if _, err := m.Run.Run(ctx, "systemd-run", args...); err != nil {
+		"--property=Restart=no", "--property=LimitCORE=0",
+	}
+	args = append(args, m.confinement(dir, groups)...)
+	args = append(args, "--", "qemu-system-x86_64")
+	m.mu.Lock()
+	r.Started = true
+	m.mu.Unlock()
+	if err := m.save(r); err != nil {
+		return err
+	}
+	if _, err := m.Run.Run(ctx, "systemd-run", append(args, spec.Args()...)...); err != nil {
 		return err
 	}
 	// QEMU fails fast on bad devices or memory: give it a moment.
@@ -555,6 +682,116 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 		return fmt.Errorf("qemu did not stay up (%s): %s", st, lastLines(string(out), 6))
 	}
 	return nil
+}
+
+// groupDevices maps PCI functions to their /dev/vfio/<group> nodes.
+func (m *Manager) groupDevices(addrs []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, a := range addrs {
+		d, err := m.Sys.Device(a)
+		if err != nil {
+			return nil, err
+		}
+		if d.IOMMUGroup == "" {
+			return nil, fmt.Errorf("%s has no IOMMU group", a)
+		}
+		p := "/dev/vfio/" + d.IOMMUGroup
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// giveToQemu hands the VM's files and VFIO groups to the unprivileged QEMU
+// user.
+func (m *Manager) giveToQemu(r *Record, groups []string) error {
+	if m.QemuUser == "" {
+		return nil
+	}
+	u, err := user.Lookup(m.QemuUser)
+	if err != nil {
+		return fmt.Errorf("qemu user: %w", err)
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	dir := m.dir(r.ID)
+	if err := os.Chown(dir, uid, gid); err != nil {
+		return err
+	}
+	for _, f := range []string{"disk.qcow2", "OVMF_VARS.fd", "seed.iso"} {
+		if err := os.Chown(filepath.Join(dir, f), uid, gid); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	for _, g := range groups {
+		if err := os.Chown(g, uid, gid); err != nil {
+			return fmt.Errorf("vfio group %s: %w", g, err)
+		}
+	}
+	return nil
+}
+
+// takeBack returns VFIO groups to root once a VM is gone.
+func (m *Manager) takeBack(groups []string) {
+	for _, g := range groups {
+		_ = os.Chown(g, 0, 0)
+	}
+}
+
+// confinement is the systemd sandbox for an unprivileged QEMU: no
+// capabilities, a read-only system, only its own directory writable, and
+// only the devices a VM needs.
+func (m *Manager) confinement(dir string, groups []string) []string {
+	if m.QemuUser == "" {
+		return nil
+	}
+	p := []string{
+		"--uid=" + m.QemuUser, "--gid=" + m.QemuUser,
+		"--property=SupplementaryGroups=kvm",
+		"--property=NoNewPrivileges=yes",
+		"--property=CapabilityBoundingSet=",
+		"--property=AmbientCapabilities=",
+		"--property=ProtectSystem=strict",
+		"--property=ReadWritePaths=" + dir,
+		"--property=ProtectHome=yes",
+		"--property=PrivateTmp=yes",
+		"--property=ProtectKernelTunables=yes",
+		"--property=ProtectKernelModules=yes",
+		"--property=ProtectKernelLogs=yes",
+		"--property=ProtectControlGroups=yes",
+		"--property=ProtectClock=yes",
+		"--property=ProtectHostname=yes",
+		"--property=LockPersonality=yes",
+		"--property=RestrictRealtime=yes",
+		"--property=RestrictNamespaces=yes",
+		"--property=RestrictSUIDSGID=yes",
+		"--property=SystemCallArchitectures=native",
+		"--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+		"--property=DevicePolicy=closed",
+		"--property=DeviceAllow=/dev/kvm rw",
+		"--property=DeviceAllow=/dev/net/tun rw",
+		"--property=DeviceAllow=/dev/vhost-net rw",
+		"--property=DeviceAllow=/dev/vfio/vfio rw",
+		"--property=DeviceAllow=/dev/urandom r",
+	}
+	for _, g := range groups {
+		p = append(p, "--property=DeviceAllow="+g+" rw")
+	}
+	return p
+}
+
+// ImagesInUse lists image versions under VM disks.
+func (m *Manager) ImagesInUse() map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for _, r := range m.vms {
+		out[r.ImageVersion] = true
+	}
+	return out
 }
 
 // Reclaim records a reclaim deadline and shows it to the VM.
@@ -574,12 +811,15 @@ func (m *Manager) Reclaim(id string, deadline time.Time) error {
 }
 
 // Destroy stops a VM, removes its network and wipes its disk. Unknown ids
-// succeed (already gone). For customer VMs the GPUs are then scrubbed in the
-// background before they can be used again.
+// succeed (already gone). For customer VMs that ran, the GPUs are then
+// scrubbed in the background before they can be used again; until then a
+// create_vm on them waits.
 func (m *Manager) Destroy(ctx context.Context, id string) error {
 	if !ValidID(id) {
 		return fmt.Errorf("bad vm_id %q", id)
 	}
+	// Teardown must finish even if the caller is shutting down.
+	ctx = context.WithoutCancel(ctx)
 	m.mu.Lock()
 	m.init()
 	r, ok := m.vms[id]
@@ -587,34 +827,51 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	if !ok {
 		return nil
 	}
-	m.mu.Lock()
-	r.Want = false
-	m.mu.Unlock()
-	m.setState(r, StateStopping, "")
-	_, _ = m.Run.Run(ctx, "systemctl", "stop", unit(id))
-	for i := 0; i < 60 && m.unitState(ctx, id) == "deactivating"; i++ {
-		time.Sleep(time.Second)
-	}
-	if st := m.unitState(ctx, id); st == "active" || st == "deactivating" {
-		_, _ = m.Run.Run(ctx, "systemctl", "kill", "-s", "KILL", unit(id))
-		time.Sleep(2 * time.Second)
-	}
-	_, _ = m.Run.Run(ctx, "systemctl", "reset-failed", unit(id))
-	m.Meta.Remove(r.GuestIP)
-	m.Net.DelTap(ctx, r.Tap)
-	// Move the directory aside, then overwrite the disk before deleting it.
-	wipe := filepath.Join(m.DataDir, "vms", ".wipe-"+id)
-	if err := os.Rename(m.dir(id), wipe); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("move disk aside: %w", err)
-	}
 	gpus := append([]int{}, r.GPUIndexes...)
-	scrub := m.Scrub && !r.Ephemeral && len(gpus) > 0
+	scrub := m.Scrub && !r.Ephemeral && r.Started && len(gpus) > 0
 	if scrub {
-		// Remember the scrub before the record goes, so a restart still does it.
+		// Remember the scrub before anything else, so a crash or restart at
+		// any point still does it.
 		b, _ := json.Marshal(gpus)
 		if err := config.WriteFileAtomic(m.scrubMarker(id), b, 0o600); err != nil {
 			return fmt.Errorf("scrub marker: %w", err)
 		}
+	}
+	m.mu.Lock()
+	r.Want = false
+	if r.Owner == "" {
+		for _, g := range gpus {
+			m.busy[g] = "destroying:" + id
+		}
+	}
+	m.mu.Unlock()
+	m.setState(r, StateStopping, "")
+	_, _ = m.Run.Run(ctx, "systemctl", "stop", unit(id))
+	st := m.unitState(ctx, id)
+	for i := 0; i < 60 && st == "deactivating"; i++ {
+		time.Sleep(time.Second)
+		st = m.unitState(ctx, id)
+	}
+	if st == "active" || st == "deactivating" || st == "activating" {
+		_, _ = m.Run.Run(ctx, "systemctl", "kill", "-s", "KILL", unit(id))
+		time.Sleep(2 * time.Second)
+		st = m.unitState(ctx, id)
+	}
+	if st != "inactive" && st != "failed" {
+		// QEMU may still hold the disk and GPUs: keep the record (Want is
+		// false), so a retry or the next start finishes the destroy.
+		return fmt.Errorf("vm %s did not stop (systemd says %q)", id, st)
+	}
+	_, _ = m.Run.Run(ctx, "systemctl", "reset-failed", unit(id))
+	m.Meta.Remove(r.GuestIP)
+	m.Net.DelTap(ctx, r.Tap)
+	if groups, err := m.groupDevices(r.PassThrough); err == nil {
+		m.takeBack(groups)
+	}
+	// Move the directory aside, then overwrite the disk before deleting it.
+	wipe := filepath.Join(m.DataDir, "vms", ".wipe-"+id)
+	if err := os.Rename(m.dir(id), wipe); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("move disk aside: %w", err)
 	}
 	m.wipeDir(wipe)
 	m.mu.Lock()
@@ -631,7 +888,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	}
 	m.mu.Unlock()
 	if scrub {
-		m.startScrub(ctx, id, gpus)
+		m.startScrub(id, gpus)
 	}
 	return nil
 }
@@ -640,48 +897,121 @@ func (m *Manager) scrubMarker(id string) string {
 	return filepath.Join(m.DataDir, "vms", ".scrub-"+id)
 }
 
-func (m *Manager) startScrub(ctx context.Context, id string, gpus []int) {
+// startScrub runs a scrub under the manager's own context (Ctx), which the
+// agent cancels at shutdown: a cancelled scrub keeps its marker and resumes
+// after the restart.
+func (m *Manager) startScrub(id string, gpus []int) {
+	ctx := m.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.scrub(context.WithoutCancel(ctx), id, gpus)
+		m.scrub(ctx, id, gpus)
 	}()
 }
 
 // scrub overwrites the memory of GPUs a customer just used. Until it
-// passes, the GPUs stay out of use.
+// passes, the GPUs stay out of use, across restarts. A scrub that couldn't
+// run (no image, no capacity, a timeout) says nothing about the GPUs and is
+// retried with backoff; one that ran and failed holds them until a passing
+// benchmark.
 func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
-	defer cancel()
 	owner := "scrub:" + after
+	m.Hold(gpus)
 	m.mu.Lock()
 	for _, g := range gpus {
-		m.scrubOK[g] = false
 		m.busy[g] = owner
 	}
 	m.mu.Unlock()
-	out, err := m.RunEphemeral(ctx, "scrub-"+shortID(after), owner, gpus, ScrubScript, 15*time.Minute)
-	ok := err == nil
-	if ok {
-		var res struct {
-			OK bool `json:"ok"`
+	var err error
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			wait := min(time.Duration(1<<min(attempt, 5))*time.Minute, 30*time.Minute)
+			select {
+			case <-ctx.Done():
+				return // marker kept: the next start resumes it
+			case <-time.After(wait):
+			}
 		}
-		ok = json.Unmarshal(out, &res) == nil && res.OK
-		if !ok {
-			err = fmt.Errorf("scrub reported failure: %s", truncate(string(out), 300))
+		id := fmt.Sprintf("scrub-%s-%d", hex.EncodeToString(hash(after))[:10], time.Now().UnixNano()%1e9)
+		rctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		var out []byte
+		out, err = m.RunEphemeral(rctx, id, owner, gpus, ScrubScript, 15*time.Minute)
+		cancel()
+		if ctx.Err() != nil {
+			return // shutting down: marker kept
 		}
+		if err != nil {
+			m.Log.Warn("gpu scrub could not run; retrying", "after", after, "gpus", gpus, "err", err)
+			continue
+		}
+		err = m.checkScrub(out, gpus)
+		break
+	}
+	if err == nil {
+		m.ClearHold(gpus)
 	}
 	m.mu.Lock()
 	for _, g := range gpus {
-		m.scrubOK[g] = ok
 		if m.busy[g] == owner {
 			delete(m.busy, g)
 		}
 	}
 	m.mu.Unlock()
 	_ = os.Remove(m.scrubMarker(after))
-	if !ok {
+	if err != nil {
 		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes", "after", after, "gpus", gpus, "err", err)
+	}
+}
+
+// checkScrub requires one passing entry per scrubbed GPU, matched by UUID
+// when the host knows it: a GPU missing from the VM was not wiped.
+func (m *Manager) checkScrub(out []byte, gpus []int) error {
+	var res struct {
+		OK   bool `json:"ok"`
+		GPUs []struct {
+			UUID string `json:"uuid"`
+			OK   bool   `json:"ok"`
+		} `json:"gpus"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(out, &res); err != nil {
+		return fmt.Errorf("scrub output: %w", err)
+	}
+	if !res.OK {
+		return fmt.Errorf("scrub reported failure: %s", truncate(res.Error, 300))
+	}
+	if len(res.GPUs) != len(gpus) {
+		return fmt.Errorf("scrub saw %d GPUs, expected %d", len(res.GPUs), len(gpus))
+	}
+	seen := map[string]bool{}
+	for _, g := range res.GPUs {
+		if !g.OK {
+			return fmt.Errorf("scrub failed on %s", g.UUID)
+		}
+		seen[strings.ToLower(g.UUID)] = true
+	}
+	for _, idx := range gpus {
+		if gpu, ok := m.gpu(idx); ok && gpu.UUID != "" && !seen[strings.ToLower(gpu.UUID)] {
+			return fmt.Errorf("gpu %d (%s) was not in the scrub", idx, gpu.UUID)
+		}
+	}
+	return nil
+}
+
+// Hold keeps GPUs out of rentals (after a failed benchmark) until ClearHold.
+func (m *Manager) Hold(gpus []int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.init()
+	_ = os.MkdirAll(filepath.Join(m.DataDir, "holds"), 0o700)
+	for _, g := range gpus {
+		m.scrubOK[g] = false
+		if err := os.WriteFile(m.holdPath(g), nil, 0o600); err != nil {
+			m.Log.Error("persist gpu hold", "gpu", g, "err", err)
+		}
 	}
 }
 
@@ -692,6 +1022,7 @@ func (m *Manager) ClearHold(gpus []int) {
 	m.init()
 	for _, g := range gpus {
 		m.scrubOK[g] = true
+		_ = os.Remove(m.holdPath(g))
 	}
 }
 
@@ -700,6 +1031,13 @@ func (m *Manager) ClearHold(gpus []int) {
 func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error) {
 	if !ValidID(id) {
 		return nil, fmt.Errorf("bad id %q", id)
+	}
+	m.mu.Lock()
+	m.init()
+	_, exists := m.vms[id]
+	m.mu.Unlock()
+	if exists {
+		return nil, fmt.Errorf("throwaway vm %s already exists", id)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -770,6 +1108,15 @@ func zeroFile(p string) error {
 		left -= n
 	}
 	return f.Sync()
+}
+
+// allocated is the space a file really uses on disk.
+func allocated(p string) uint64 {
+	var st syscall.Stat_t
+	if err := syscall.Stat(p, &st); err != nil {
+		return 0
+	}
+	return uint64(st.Blocks) * 512
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

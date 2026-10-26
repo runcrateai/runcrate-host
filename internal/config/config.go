@@ -30,8 +30,11 @@ type Config struct {
 	Site   string `json:"site,omitempty"`
 	// GPUs restricts Runcrate to these PCI addresses; empty means every
 	// NVIDIA GPU on the host.
-	GPUs    []string `json:"gpus,omitempty"`
-	DataDir string   `json:"data_dir"`
+	GPUs []string `json:"gpus,omitempty"`
+	// GPUIndex fixes each registered GPU's index by PCI address, so indexes
+	// never shift when a card is missing.
+	GPUIndex map[string]int `json:"gpu_index,omitempty"`
+	DataDir  string         `json:"data_dir"`
 	// VMSubnet is carved into one /30 per VM (host .1, guest .2).
 	VMSubnet string `json:"vm_subnet"`
 	// ForwardWasOff records that IPv4 forwarding was off before install, so
@@ -41,6 +44,9 @@ type Config struct {
 	// ScrubGPUs boots a throwaway VM that overwrites GPU memory after every
 	// customer VM, so the next customer can't read the last one's data.
 	ScrubGPUs bool `json:"scrub_gpus"`
+	// BlockedCIDRs are extra networks VMs may never reach (management
+	// VLANs, BMCs) on top of the host's own networks.
+	BlockedCIDRs []string `json:"blocked_cidrs,omitempty"`
 
 	dir string
 }
@@ -84,8 +90,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("gpus: %q is not a PCI address like 0000:41:00.0", g)
 		}
 	}
-	if !filepath.IsAbs(c.DataDir) {
-		return fmt.Errorf("data_dir must be absolute: %q", c.DataDir)
+	if !filepath.IsAbs(c.DataDir) || filepath.Clean(c.DataDir) != c.DataDir || strings.ContainsAny(c.DataDir, ",:\n") {
+		return fmt.Errorf("data_dir must be a clean absolute path without commas or colons: %q", c.DataDir)
+	}
+	for _, sys := range []string{"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var", "/var/lib", "/mnt", "/media", "/data"} {
+		if c.DataDir == sys {
+			return fmt.Errorf("data_dir can't be %s itself; use a directory of its own, e.g. %s/runcrate-host", sys, strings.TrimSuffix(sys, "/"))
+		}
+	}
+	for _, b := range c.BlockedCIDRs {
+		if _, n, err := net.ParseCIDR(b); err != nil || n.IP.To4() == nil {
+			return fmt.Errorf("blocked_cidrs: %q is not an IPv4 CIDR", b)
+		}
 	}
 	return nil
 }

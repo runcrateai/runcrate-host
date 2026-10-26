@@ -188,6 +188,8 @@ func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, e
 			g.VRAMGB, g.UUID = c.VRAMGB, c.UUID
 		}
 		switch members, err := s.GroupMembers(d.IOMMUGroup); {
+		case s.acsOverride():
+			g.Blocker = "the kernel runs with pcie_acs_override, so IOMMU groups don't prove isolation; remove it from the kernel command line"
 		case d.IOMMUGroup == "":
 			g.Blocker = "IOMMU is off"
 		case err != nil:
@@ -211,6 +213,11 @@ func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, e
 		out = append(out, g)
 	}
 	return out, nil
+}
+
+// acsOverride reports a kernel that fakes IOMMU groups (pcie_acs_override).
+func (s Sys) acsOverride() bool {
+	return strings.Contains(readTrim(s.p("proc/cmdline")), "pcie_acs_override")
 }
 
 // NVSwitches lists NVSwitch functions (HGX baseboards).
