@@ -152,8 +152,8 @@ type Manager struct {
 
 	mu      sync.Mutex
 	vms     map[string]*Record
-	busy    map[int]string // gpu index -> vm id, or "scrub:<vm id>"
-	scrubOK map[int]bool   // false after a failed scrub: GPU held back
+	busy    map[int]string  // gpu index -> vm id, or "scrub:<vm id>"
+	scrubOK map[int]bool    // false after a failed scrub: GPU held back
 	scrubs  map[string]bool // vm ids whose scrub was started in this run
 	wg      sync.WaitGroup
 }
