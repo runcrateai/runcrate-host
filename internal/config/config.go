@@ -162,6 +162,35 @@ func (c *Config) SaveCredential(cred string) error {
 	return WriteFileAtomic(c.CredentialPath(), []byte(cred+"\n"), 0o600)
 }
 
+// DataMarker marks a data directory as runcrate-host's own. The agent only
+// takes a new or empty directory, so images, VM disks and the uninstaller
+// never touch a partner's files that happen to live there.
+const DataMarker = ".runcrate-host-data"
+
+// ClaimDataDir makes dir runcrate-host's data directory: it must be new,
+// empty, or already carry the marker.
+func ClaimDataDir(dir string) error {
+	marker := filepath.Join(dir, DataMarker)
+	if _, err := os.Lstat(marker); err == nil {
+		return nil
+	}
+	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
+		return fmt.Errorf("data directory %s already has files in it: give runcrate-host a new or empty directory (--data-dir)", dir)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o711); err != nil {
+		return err
+	}
+	return WriteFileAtomic(marker, []byte("runcrate-host data directory: VM disks and images. Removed by the uninstaller.\n"), 0o600)
+}
+
+// OwnsDataDir reports whether dir carries the marker.
+func OwnsDataDir(dir string) bool {
+	fi, err := os.Lstat(filepath.Join(dir, DataMarker))
+	return err == nil && fi.Mode().IsRegular()
+}
+
 // WriteFileAtomic writes via a temp file and rename, with mode set before
 // any content lands.
 func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {

@@ -159,14 +159,19 @@ uninstall() {
 			[ -n "$u" ] && systemctl enable --now "$u" >/dev/null 2>&1 || true
 		done < "$DISABLED_UNITS"
 	fi
-	# Only what the agent itself creates in the data directory; the directory
-	# goes too when that leaves it empty. Anything else in it stays.
+	# Only a data directory the agent claimed (new or empty, with its marker),
+	# and in it only what the agent creates; the directory goes too when that
+	# leaves it empty.
 	data=$(data_dir)
-	rm -rf "$data/vms" "$data/images" "$data/holds"
-	rm -f "$data/state.json" "$data/gpus-cache.json" "$data/.runcrate-diskbench" \
-		"$data"/.state.json.tmp* "$data"/.gpus-cache.json.tmp*
-	if [ -d "$data" ] && ! rmdir "$data" 2>/dev/null; then
-		say "Left $data in place: it holds files runcrate-host didn't create."
+	if [ -f "$data/.runcrate-host-data" ] && [ ! -L "$data/.runcrate-host-data" ]; then
+		rm -rf "$data/vms" "$data/images" "$data/holds"
+		rm -f "$data/state.json" "$data/gpus-cache.json" "$data/.runcrate-diskbench" \
+			"$data"/.state.json.tmp* "$data"/.gpus-cache.json.tmp* "$data/.runcrate-host-data"
+		if ! rmdir "$data" 2>/dev/null; then
+			say "Left $data in place: it holds files runcrate-host didn't create."
+		fi
+	elif [ -d "$data" ]; then
+		say "Left $data alone: it isn't marked as runcrate-host's data directory."
 	fi
 	rm -rf "$CONF_DIR"
 	rm -f "$BIN" "$BIN.prev" "$BIN.new"
@@ -334,8 +339,7 @@ install_agent() {
 take_gpus() {
 	step "Taking the GPUs off the host"
 	if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-		# Names, memory and UUIDs while the host driver still has the GPUs.
-		"$BIN" snapshot-gpus || true
+		# (Registering reads names, memory and UUIDs from the host driver.)
 		busy=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)
 		[ -z "$busy" ] || die "these processes are using the GPUs; stop them and run again:
 $busy"
@@ -393,6 +397,9 @@ Wants=network-online.target runcrate-host-gpus.service
 StartLimitIntervalSec=0
 [Service]
 ExecStart=$BIN run
+# Whenever the agent stops (crash, update, revoked credential), the VMs lose
+# their network until it is back and enforcing the firewall again.
+ExecStopPost=$BIN cut-network
 Restart=always
 RestartSec=5
 # 3 = credential revoked or host delisted: don't loop.

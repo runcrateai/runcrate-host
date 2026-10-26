@@ -226,10 +226,6 @@ func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer,
 		}
 		defer closePorts()
 	}
-	nobody := func(cmd *exec.Cmd) *exec.Cmd {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
-		return cmd
-	}
 	var servers []*exec.Cmd
 	for _, a := range myAddrs {
 		cmd := nobody(exec.CommandContext(ctx, iperf, "-s", "-B", a, "-p", "5201"))
@@ -268,6 +264,13 @@ func Peers(ctx context.Context, self string, myAddrs []string, peers []api.Peer,
 	return out
 }
 
+// nobody runs a benchmark tool unprivileged: servers and clients both talk
+// to other machines.
+func nobody(cmd *exec.Cmd) *exec.Cmd {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
+	return cmd
+}
+
 func hasLower(self string, peers []api.Peer) bool {
 	for _, p := range peers {
 		if p.HostID < self {
@@ -301,7 +304,7 @@ func measure(ctx context.Context, iperf, self string, p api.Peer, rdma bool) api
 			continue
 		}
 		r.Addr, r.Reachable, r.Error = a, true, ""
-		out, err := exec.CommandContext(ctx, iperf, "-c", a, "-p", "5201", "-P", "8", "-t", "10", "-J").Output()
+		out, err := nobody(exec.CommandContext(ctx, iperf, "-c", a, "-p", "5201", "-P", "8", "-t", "10", "-J")).Output()
 		if err != nil {
 			r.Error = "iperf3: " + err.Error()
 			return r
@@ -329,7 +332,7 @@ func measure(ctx context.Context, iperf, self string, p api.Peer, rdma bool) api
 func ibWriteBW(ctx context.Context, addr string, port int) (float64, error) {
 	var last error
 	for i := 0; i < 6; i++ {
-		out, err := exec.CommandContext(ctx, "ib_write_bw", "-p", strconv.Itoa(port), "-F", "--report_gbits", "-D", "5", addr).Output()
+		out, err := nobody(exec.CommandContext(ctx, "ib_write_bw", "-p", strconv.Itoa(port), "-F", "--report_gbits", "-D", "5", addr)).Output()
 		if err == nil {
 			// The last numeric line: "#bytes #iterations BW peak BW average ..."
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")

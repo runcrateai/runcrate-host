@@ -14,8 +14,8 @@ It asks for the registration token from your Runcrate partner dashboard (input h
 - Ubuntu 22.04, Ubuntu 24.04 or Debian 12.
 - NVIDIA GPUs: datacenter cards (A100, H100, H200, B200, L40S, RTX 6000 and others) or GeForce RTX 30, 40 and 50 series.
 - Virtualization (VT-x / AMD-V) and IOMMU (VT-d / AMD-Vi) turned on in the BIOS. If the kernel has the IOMMU off, the installer shows the exact GRUB line, adds it and reboots when you say yes (or with `--yes`). Then run the same command again.
-- Outbound HTTPS. Nothing listens on your network: no inbound ports, NAT is fine.
-- Fast local disk for VM disks, 100 GB or more free (`--data-dir` to choose where).
+- Outbound HTTPS. No inbound ports, NAT is fine. The one exception: while a benchmark runs on two or more hosts of the same site, iperf3 (and ib_write_bw with InfiniBand) listens on the hosts' private addresses for up to 5 minutes, open only to the site's other hosts.
+- Fast local disk for VM disks, 100 GB or more free (`--data-dir` to choose where). The data directory must be new or empty: the agent marks it as its own (`.runcrate-host-data`) and never shares it with your files.
 - No NVIDIA driver is needed on the host. If one is installed, the installer reads each GPU's name, memory and UUID from it first.
 
 ## What the installer does
@@ -48,7 +48,7 @@ The agent calls Runcrate every 10 seconds over HTTPS with the host's state (VMs,
 Customer VMs are isolated from your network and from each other:
 
 - each VM has its own tap device and a /30 from `10.254.0.0/16` (`vm_subnet` in the config), with no shared layer 2 between VMs;
-- the firewall (nftables table `inet runcrate_host`) lets a VM reach the internet through NAT and nothing else: not the host, not other VMs, not private, link-local or carrier NAT ranges, and nothing from outside can open a connection into a VM;
+- the firewall (nftables table `inet runcrate_host`) lets a VM reach the internet through NAT and nothing else: not the host, not other VMs, not private, link-local or carrier NAT ranges, and nothing from outside can open a connection into a VM. It is re-applied every 5 seconds, and whenever the agent is not running (stopped, crashed, updating or delisted) every VM's network is set down, so isolation never depends on a firewall nobody is watching;
 - the only host service a VM can reach is the metadata server at `http://169.254.169.254`, which answers each VM only about itself;
 - if Docker or ufw set the iptables FORWARD policy to DROP, the agent adds two narrow accept rules for its own `rc-*` interfaces; if IPv4 forwarding was off before the install, the agent drops any other forwarding so the host doesn't start routing for anything else.
 
@@ -95,7 +95,7 @@ Useful commands: `runcrate-host status`, `journalctl -u runcrate-host -f`, `runc
 curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall
 ```
 
-This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot and udev rules and the IOMMU GRUB line it added, the `runcrate-vm` users and group, the agent and its config. In the data directory it deletes only what the agent created (`vms/`, `images/`, `holds/`, `state.json`, `gpus-cache.json`), and the directory itself only if that leaves it empty. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
+This stops every VM, overwrites and deletes their disks, removes the VM network and firewall table, gives every GPU back to the host (your NVIDIA driver picks them up again, or after a reboot), turns `nvidia-persistenced` back on if the installer stopped it, removes the boot and udev rules and the IOMMU GRUB line it added, the `runcrate-vm` users and group, the agent and its config. In the data directory (only one carrying the agent's marker) it deletes only what the agent created (`vms/`, `images/`, `holds/`, `state.json`, `gpus-cache.json`), and the directory itself only if that leaves it empty. Packages it installed (qemu, ovmf, nftables, iperf3) are left in place. Delist the host in your dashboard as well.
 
 ## Development
 

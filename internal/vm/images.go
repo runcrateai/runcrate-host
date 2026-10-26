@@ -17,9 +17,13 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 	"github.com/runcrateai/runcrate-host/internal/sysexec"
 	"github.com/runcrateai/runcrate-host/internal/update"
 )
+
+// MaxImageBytes bounds a base image download (the current image is under 2 GB).
+const MaxImageBytes = 32 << 30
 
 var versionRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
@@ -191,13 +195,25 @@ func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("download image: HTTP %d", resp.StatusCode)
 	}
+	// The signature covers the hash, not the size or URL: bound what a
+	// download may take from the disk VMs live on.
+	if resp.ContentLength > MaxImageBytes {
+		return fmt.Errorf("download image: %d bytes is over the %d byte limit", resp.ContentLength, int64(MaxImageBytes))
+	}
+	if free, _ := hw.DiskFree(s.Dir); free > 0 && resp.ContentLength > 0 && uint64(resp.ContentLength)+uint64(ReserveDiskGB)<<30 > free {
+		return fmt.Errorf("download image: %d bytes don't fit (%d free, %d GB kept for the host)", resp.ContentLength, free, ReserveDiskGB)
+	}
 	tmp, err := os.CreateTemp(s.Dir, ".download-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, MaxImageBytes+1))
+	if err == nil && n > MaxImageBytes {
+		err = fmt.Errorf("over the %d byte limit", int64(MaxImageBytes))
+	}
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("download image: %w", err)
 	}

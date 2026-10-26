@@ -50,6 +50,7 @@ Usage:
   runcrate-host snapshot-gpus        record GPU names, VRAM and UUIDs while the host driver still has them
   runcrate-host bind-gpus            move the configured GPUs to vfio-pci
   runcrate-host release-gpus         give every GPU back to the host
+  runcrate-host cut-network          set every VM's network down (run when the agent stops)
   runcrate-host uninstall-runtime    stop all VMs, wipe their disks, remove the VM network, release the GPUs
   runcrate-host console <vm id>      the VM's serial console (last 1 MB)
   runcrate-host version
@@ -86,6 +87,11 @@ func main() {
 		err = withConfig(dir, func(cfg *config.Config) error { return releaseGPUs(cfg) })
 	case "uninstall-runtime":
 		err = cmdUninstallRuntime(ctx, dir, log)
+	case "cut-network":
+		err = withConfig(dir, func(cfg *config.Config) error {
+			_, subnet, _ := net.ParseCIDR(cfg.VMSubnet)
+			return (&vm.Network{Subnet: subnet, Run: sysexec.Exec{}, ProcRoot: "/"}).CutTaps(ctx)
+		})
 	case "console":
 		if len(os.Args) != 3 {
 			err = errors.New("usage: runcrate-host console <vm id>")
@@ -253,6 +259,9 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 		return err
 	}
 	if err := devmode.Check(cfg.APIURL); err != nil {
+		return err
+	}
+	if err := config.ClaimDataDir(cfg.DataDir); err != nil {
 		return err
 	}
 	if err := cfg.Save(); err != nil {
@@ -432,8 +441,8 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o711); err != nil {
-		return err
+	if !config.OwnsDataDir(cfg.DataDir) {
+		return fmt.Errorf("%s is not runcrate-host's data directory (no %s): register again", cfg.DataDir, config.DataMarker)
 	}
 	if err := ensureQemuUser(ctx); err != nil {
 		return err
@@ -521,6 +530,11 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 	case err := <-runErr:
 		cancel()
 		mgrCancel()
+		if errors.Is(err, api.ErrUnauthorized) {
+			// Revoked or delisted: nothing may keep running for customers.
+			log.Error("host credential rejected; stopping every VM", "err", err)
+			rt.mgr.StopAll(context.Background())
+		}
 		return err
 	}
 }

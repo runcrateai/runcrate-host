@@ -24,9 +24,10 @@ SIZE=16G
 
 case "$VERSION" in *[!A-Za-z0-9._-]*|"") echo "bad version: $VERSION" >&2; exit 1 ;; esac
 [ -e /dev/kvm ] || { echo "needs KVM (/dev/kvm)" >&2; exit 1; }
-for c in qemu-system-x86_64 qemu-img genisoimage curl sha256sum; do
-	command -v "$c" >/dev/null || { echo "missing $c (apt install qemu-system-x86 qemu-utils genisoimage curl)" >&2; exit 1; }
+for c in qemu-system-x86_64 qemu-img genisoimage curl sha256sum gpgv; do
+	command -v "$c" >/dev/null || { echo "missing $c (apt install qemu-system-x86 qemu-utils genisoimage curl gpgv ubuntu-cloudimage-keyring)" >&2; exit 1; }
 done
+[ -f /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg ] || { echo "missing Ubuntu's cloud image key (apt install ubuntu-cloudimage-keyring)" >&2; exit 1; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -35,12 +36,9 @@ mkdir -p "$OUT"
 echo "==> Ubuntu 24.04 cloud image"
 curl -fsSL -o "$work/$BASE" "$BASE_URL/$BASE"
 curl -fsSL -o "$work/SHA256SUMS" "$BASE_URL/SHA256SUMS"
-if [ -f /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg ] && command -v gpgv >/dev/null; then
-	curl -fsSL -o "$work/SHA256SUMS.gpg" "$BASE_URL/SHA256SUMS.gpg"
-	gpgv --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg "$work/SHA256SUMS.gpg" "$work/SHA256SUMS"
-else
-	echo "warning: ubuntu-cloudimage-keyring not installed; SHA256SUMS signature not checked" >&2
-fi
+# The base image is trusted only through Ubuntu's signed SHA256SUMS.
+curl -fsSL -o "$work/SHA256SUMS.gpg" "$BASE_URL/SHA256SUMS.gpg"
+gpgv --keyring /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg "$work/SHA256SUMS.gpg" "$work/SHA256SUMS"
 (cd "$work" && grep " \*$BASE\$" SHA256SUMS | sha256sum -c -)
 cp "$work/$BASE" "$work/build.qcow2"
 qemu-img resize -q "$work/build.qcow2" "$SIZE"

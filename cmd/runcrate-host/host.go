@@ -66,7 +66,7 @@ func snapshotGPUs(ctx context.Context, cfg *config.Config) (gpuCache, error) {
 	if t, err := exec.CommandContext(ctx, smi, "topo", "-m").Output(); err == nil {
 		c.Topo = string(t)
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+	if err := config.ClaimDataDir(cfg.DataDir); err != nil {
 		return c, err
 	}
 	b, _ := json.MarshalIndent(c, "", "  ")
@@ -231,7 +231,26 @@ func (h *host) Peers(ctx context.Context, peers []api.Peer, topo api.Topology) [
 			rdma = true
 		}
 	}
-	return bench.Peers(ctx, h.cfg.HostID, topo.PrivateAddrs, peers, rdma, func(addrs []string) (func(), error) {
+	// Peers are dialled only on private addresses inside this host's own
+	// connected private networks; anything else the control plane names is
+	// dropped.
+	nets := hw.PrivateNets(h.subnet)
+	onSite := make([]api.Peer, 0, len(peers))
+	for _, p := range peers {
+		var addrs []string
+		for _, a := range p.PrivateAddrs {
+			ip := net.ParseIP(a)
+			for _, n := range nets {
+				if ip != nil && ip.IsPrivate() && n.Contains(ip) {
+					addrs = append(addrs, ip.String())
+					break
+				}
+			}
+		}
+		p.PrivateAddrs = addrs
+		onSite = append(onSite, p)
+	}
+	return bench.Peers(ctx, h.cfg.HostID, topo.PrivateAddrs, onSite, rdma, func(addrs []string) (func(), error) {
 		return h.openPeerPorts(ctx, addrs)
 	})
 }

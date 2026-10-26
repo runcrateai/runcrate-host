@@ -176,11 +176,21 @@ func parseRate(s string) float64 {
 // PrivateAddrs lists RFC 1918 IPv4 addresses on physical interfaces,
 // skipping exclude (our own VM network).
 func PrivateAddrs(exclude *net.IPNet) []string {
+	var out []string
+	for _, n := range PrivateNets(exclude) {
+		out = append(out, n.IP.String())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// PrivateNets is PrivateAddrs with each address's connected prefix.
+func PrivateNets(exclude *net.IPNet) []*net.IPNet {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	var out []string
+	var out []*net.IPNet
 	for _, ifc := range ifs {
 		if ifc.Flags&net.FlagLoopback != 0 || ifc.Flags&net.FlagUp == 0 || strings.HasPrefix(ifc.Name, "rc-") {
 			continue
@@ -197,9 +207,8 @@ func PrivateAddrs(exclude *net.IPNet) []string {
 			if exclude != nil && exclude.Contains(ipn.IP) {
 				continue
 			}
-			out = append(out, ipn.IP.String())
+			out = append(out, ipn)
 		}
 	}
-	sort.Strings(out)
 	return out
 }

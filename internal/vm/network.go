@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -334,6 +335,25 @@ func (n *Network) AddTap(ctx context.Context, name string, slot int, user string
 // DelTap removes a VM's tap device (missing is fine).
 func (n *Network) DelTap(ctx context.Context, name string) {
 	_, _ = n.Run.Run(ctx, "ip", "link", "del", "dev", name)
+}
+
+// CutTaps sets every VM tap down. It runs whenever the agent stops (the
+// unit's ExecStopPost), so while nothing re-applies the firewall the VMs
+// have no network at all; the agent brings the taps back up on start.
+func (n *Network) CutTaps(ctx context.Context) error {
+	var errs []error
+	for _, t := range n.taps() {
+		if _, err := n.Run.Run(ctx, "ip", "link", "set", "dev", t, "down"); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", t, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// UpTap sets a VM's tap up again after the agent restarted.
+func (n *Network) UpTap(ctx context.Context, name string) error {
+	_, err := n.Run.Run(ctx, "ip", "link", "set", "dev", name, "up")
+	return err
 }
 
 // Teardown removes everything Setup and AddTap made. Used by uninstall.

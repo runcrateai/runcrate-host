@@ -325,6 +325,16 @@ func (m *Manager) setState(r *Record, state, msg string) {
 
 // List reports customer VMs for the heartbeat, refreshing each one's state
 // from systemd.
+// StopAll stops every VM's QEMU and keeps the records and disks (the host
+// was delisted; uninstall wipes them).
+func (m *Manager) StopAll(ctx context.Context) {
+	for _, id := range m.IDs() {
+		if _, err := m.Run.Run(ctx, "systemctl", "stop", unit(id)); err != nil {
+			m.Log.Error("stop vm", "vm", id, "err", err)
+		}
+	}
+}
+
 // IDs lists every loaded VM, throwaway ones included.
 func (m *Manager) IDs() []string {
 	m.mu.Lock()
@@ -644,7 +654,11 @@ func (m *Manager) prepare(ctx context.Context, r *Record) error {
 // start brings up networking, GPUs and the QEMU unit for a prepared VM.
 func (m *Manager) start(ctx context.Context, r *Record) error {
 	if st := m.unitState(ctx, r.ID); st == "active" || st == "activating" {
-		// Already running (agent restart): only the metadata entry is new.
+		// Already running (agent restart): the agent's stop cut the tap, and
+		// the firewall is back (Setup ran first), so it goes up again.
+		if err := m.Net.UpTap(ctx, r.Tap); err != nil {
+			return fmt.Errorf("network: %w", err)
+		}
 		m.Meta.Set(r.GuestIP, &metadata.Entry{VMID: r.ID, Ephemeral: r.Ephemeral, Reclaim: r.Reclaim})
 		return nil
 	}
