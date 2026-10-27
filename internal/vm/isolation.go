@@ -132,7 +132,9 @@ const (
 
 // LANToVM checks that a machine on the host's LAN can't open a connection
 // to the VM at guestIP: a throwaway namespace routed through the host, like
-// a LAN neighbour using it as a router, tries guestIP:22. It first waits
+// a LAN neighbour using it as a router, tries guestIP:22. It proves TCP
+// connections can't be opened, not that no one-way packet (UDP) gets in:
+// the VM's answer would be dropped on its way out either way. It first waits
 // until the host itself gets an answer from guestIP:22 (connected or
 // refused): before the guest's network is up, no answer proves nothing.
 func (n *Network) LANToVM(ctx context.Context, guestIP string) api.IsolationCheck {
@@ -188,7 +190,7 @@ func (n *Network) LANToVM(ctx context.Context, guestIP string) api.IsolationChec
 		c.Detail = fmt.Sprintf("inconclusive: %s:22 stopped answering the host during the probe", guestIP)
 	default:
 		c.OK = true
-		c.Detail = fmt.Sprintf("a LAN machine routed through the host got no answer from %s:22", guestIP)
+		c.Detail = fmt.Sprintf("a LAN machine routed through the host could not open a TCP connection to %s:22", guestIP)
 	}
 	return c
 }
