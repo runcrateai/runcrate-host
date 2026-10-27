@@ -184,6 +184,8 @@ func (n *Network) LANToVM(ctx context.Context, guestIP string) api.IsolationChec
 		c.Detail = fmt.Sprintf("a LAN machine reached the VM (%s:22 refused, exit %d)", guestIP, code)
 	case !wired:
 		c.Detail = "inconclusive: the probe never reached the host"
+	case !guestAnswers(ctx, net.JoinHostPort(guestIP, "22"), 10*time.Second):
+		c.Detail = fmt.Sprintf("inconclusive: %s:22 stopped answering the host during the probe", guestIP)
 	default:
 		c.OK = true
 		c.Detail = fmt.Sprintf("a LAN machine routed through the host got no answer from %s:22", guestIP)
