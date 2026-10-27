@@ -44,6 +44,17 @@ commit=$(git rev-parse HEAD)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# Never move latest backwards: V must be the published latest or newer.
+code=$(curl -sS -o "$tmp/latest.version" -w '%{http_code}' "$PUBLIC/releases/latest/$ASSET.version") || code=000
+case "$code" in
+404) ;;
+200)
+	latest=$(head -n1 "$tmp/latest.version" | tr -d '[:space:]')
+	[ "$latest" = "$V" ] || [ "$(printf '%s\n%s\n' "$latest" "$V" | sort -V | tail -n1)" = "$V" ] ||
+		die "$V is older than the published $latest; publish a newer version" ;;
+*) die "could not check $PUBLIC/releases/latest/ (HTTP $code)" ;;
+esac
+
 echo "==> Building runcrate-host $V from $commit"
 make -s clean release VERSION="$V"
 go version -m "out/$ASSET" | grep -q -- "-X main.version=$V" || die "out/$ASSET was not built with version $V"

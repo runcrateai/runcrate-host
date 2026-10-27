@@ -135,4 +135,4 @@ The repo is private, so GitHub release downloads don't work for partners. `get.r
 | `https://get.runcrate.ai/releases/latest/runcrate-host-linux-amd64`, `.sig`, `.version` | the agent the installer downloads (60 s cache) |
 | `https://get.runcrate.ai/releases/<version>/...` | the same, kept for good |
 
-Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which verifies both signatures with `openssl` against the key in this checkout's `install.sh` and checks that the installer, the latest agent and the versioned copy agree. A version is never replaced by a different build; a failed upload is finished by running the same command again.
+Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which verifies both signatures with `openssl` against the key in this checkout's `install.sh` and checks that the installer, the latest agent and the versioned copy agree. A version is never replaced by a different build, and `latest` never moves back to an older version (to roll back, publish the old code as a newer version); a failed upload is finished by running the same command again.
