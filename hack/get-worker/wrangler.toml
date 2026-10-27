@@ -1,0 +1,13 @@
+# get.runcrate.ai. Deploy: cd hack/get-worker && wrangler deploy
+name = "runcrate-get"
+main = "index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+routes = [
+  { pattern = "get.runcrate.ai", custom_domain = true }
+]
+
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "runcrate-host-images"

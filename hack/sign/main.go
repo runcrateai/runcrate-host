@@ -1,8 +1,12 @@
 // Command sign writes <file>.sig for a release artifact. The ed25519 seed
 // comes from RUNCRATE_HOST_SIGNING_KEY (base64), e.g.
 //
-//	RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
+//	RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -a runcrate-host -w) \
 //	  go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64
+//
+// Kinds: runcrate-host (the agent binary), runcrate-vm (a VM image) and
+// runcrate-install (install.sh, served as get.runcrate.ai/host).
+// hack/publish.sh signs and uploads a whole release.
 package main
 
 import (
@@ -20,12 +24,14 @@ import (
 )
 
 func main() {
-	kind := flag.String("kind", "", "runcrate-host or runcrate-vm")
+	kind := flag.String("kind", "", "runcrate-host, runcrate-vm or runcrate-install")
 	version := flag.String("version", "", "artifact version")
 	sum := flag.String("sha256", "", "sign this sha256 instead of hashing FILE (FILE need not exist; for artifacts built elsewhere)")
 	flag.Parse()
-	if (*kind != release.KindAgent && *kind != release.KindImage) || *version == "" || flag.NArg() != 1 {
-		log.Fatal("usage: sign -kind runcrate-host|runcrate-vm -version V [-sha256 HEX] FILE")
+	switch {
+	case *kind != release.KindAgent && *kind != release.KindImage && *kind != release.KindInstaller,
+		*version == "", flag.NArg() != 1:
+		log.Fatal("usage: sign -kind runcrate-host|runcrate-vm|runcrate-install -version V [-sha256 HEX] FILE")
 	}
 	seed, err := base64.StdEncoding.DecodeString(os.Getenv("RUNCRATE_HOST_SIGNING_KEY"))
 	if err != nil || len(seed) != ed25519.SeedSize {

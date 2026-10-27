@@ -113,10 +113,26 @@ This stops every VM, overwrites and deletes their disks, removes the VM network 
 ```sh
 go test ./...
 make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
-RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
-  go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64   # .sig
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
-RUNCRATE_HOST_SIGNING_KEY=... go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
+RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -a runcrate-host -w) \
+  go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
 ```
 
 The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cudart, cuBLAS), Fabric Manager and `rc-gpubench`. Everything a customer machine needs beyond that comes from its setup script at first boot.
+
+### Publishing a release
+
+```sh
+hack/publish.sh 0.1.1                # from a clean checkout of a commit on origin/main, on the owner's Mac
+hack/check-install.sh                # any time: what partners download is signed and consistent
+```
+
+The repo is private, so GitHub release downloads don't work for partners. `get.runcrate.ai` is the Worker in `hack/get-worker` (`cd hack/get-worker && wrangler deploy`): it serves only these release files, read-only, from the R2 bucket `runcrate-host-images`. `publish.sh` builds the agent, signs it (`runcrate-host`) and `install.sh` (`runcrate-install`) with the release key, and uploads:
+
+| URL | What |
+| --- | --- |
+| `https://get.runcrate.ai/host`, `host.sig`, `host.version` | the installer, its signature and version (60 s cache) |
+| `https://get.runcrate.ai/releases/latest/runcrate-host-linux-amd64`, `.sig`, `.version` | the agent the installer downloads (60 s cache) |
+| `https://get.runcrate.ai/releases/<version>/...` | the same, kept for good |
+
+Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which verifies both signatures with `openssl` against the key in this checkout's `install.sh` and checks that the installer, the latest agent and the versioned copy agree. A version is never replaced by a different build; a failed upload is finished by running the same command again.

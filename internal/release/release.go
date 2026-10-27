@@ -1,9 +1,10 @@
-// Package release checks Runcrate's release signatures. Agent binaries and
-// VM images are signed offline with an ed25519 key whose public half is built
-// into the agent, so a compromised control plane can't push code or images:
+// Package release checks Runcrate's release signatures. Agent binaries, VM
+// images and the installer script are signed offline with an ed25519 key
+// whose public half is built into the agent (and into install.sh), so a
+// compromised control plane or download server can't push code or images:
 // it can only point at releases Runcrate signed. The signature covers the
 // kind, the version and the sha256, so a signed artifact can't be passed off
-// as another version.
+// as another kind or another version.
 package release
 
 import (
@@ -25,8 +26,9 @@ const PublicKey = "YBrMXteHsZh26jJMcMZ3PI05QmTbNcd7gy9ALNlW2Yc="
 
 // Kinds of signed artifacts.
 const (
-	KindAgent = "runcrate-host"
-	KindImage = "runcrate-vm"
+	KindAgent     = "runcrate-host"
+	KindImage     = "runcrate-vm"
+	KindInstaller = "runcrate-install"
 )
 
 // Message is what gets signed.
@@ -40,11 +42,15 @@ func Verify(kind, version, sha256, sigB64 string) error {
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return errors.New("bad built-in release key")
 	}
+	return verify(ed25519.PublicKey(pub), kind, version, sha256, sigB64)
+}
+
+func verify(pub ed25519.PublicKey, kind, version, sha256, sigB64 string) error {
 	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(sigB64))
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return errors.New("signature is not a base64 ed25519 signature")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), Message(kind, version, sha256), sig) {
+	if !ed25519.Verify(pub, Message(kind, version, sha256), sig) {
 		return fmt.Errorf("%s %s is not signed by Runcrate", kind, version)
 	}
 	return nil

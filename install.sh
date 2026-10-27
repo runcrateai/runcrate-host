@@ -5,11 +5,16 @@
 #   curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --token-file /root/runcrate-token
 #   curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall
 #
+# This script is signed like the agent: https://get.runcrate.ai/host.sig is
+# Runcrate's ed25519 signature of it as runcrate-install <host.version>
+# (hack/check-install.sh verifies it). The agent comes from
+# https://get.runcrate.ai/releases/latest and is refused unless signed.
+#
 # Every step checks before it changes anything, so running it again is safe.
 # Everything runs from main() on the last line, so a cut-off download does nothing.
 set -eu
 
-BASE_URL="${RUNCRATE_HOST_BASE_URL:-https://github.com/runcrateai/runcrate-host/releases/latest/download}"
+BASE_URL="${RUNCRATE_HOST_BASE_URL:-https://get.runcrate.ai/releases/latest}"
 ASSET=runcrate-host-linux-amd64
 BIN=/usr/local/bin/runcrate-host
 CONF_DIR=/etc/runcrate-host
