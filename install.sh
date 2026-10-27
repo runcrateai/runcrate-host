@@ -112,16 +112,16 @@ ask() {
 read_token() {
 	if [ -n "$TOKEN_FILE" ]; then
 		[ -f "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ] || die "can't read --token-file $TOKEN_FILE"
-		TOKEN=$(sed -n '1{s/[[:space:]]//g;p;}' "$TOKEN_FILE")
-		[ -n "$TOKEN" ] || die "--token-file $TOKEN_FILE is empty"
-		return 0
-	fi
 		# Other users must not be able to read (or swap) the token.
 		perm=$(stat -L -c '%u %a' "$TOKEN_FILE")
 		case "$perm" in
 			"0 "[0-7]00 | "0 "[0-7]) ;;
 			*) die "--token-file $TOKEN_FILE must be owned by root and readable by root only: chown root $TOKEN_FILE && chmod 600 $TOKEN_FILE" ;;
 		esac
+		TOKEN=$(sed -n '1{s/[[:space:]]//g;p;}' "$TOKEN_FILE")
+		[ -n "$TOKEN" ] || die "--token-file $TOKEN_FILE is empty"
+		return 0
+	fi
 	[ -f "$CONF_DIR/credential" ] && return 0
 	if has_tty; then
 		printf 'Registration token (from your Runcrate partner dashboard): ' > /dev/tty
