@@ -106,18 +106,25 @@ func (s *ImageStore) Local(ctx context.Context, version string) (string, string,
 	return s.Ensure(ctx, "")
 }
 
-// Checked describes a local image version: an image only lands on disk after
-// its sha256 matched (and its signature verified, when Verify is set), so
-// being here is the proof; ready_at is when the download finished.
+// Checked describes a local image version as its download recorded it: the
+// sha256 matched and (with Verify set) the signature verified, and when. An
+// image without that record (copied in by hand, or fetched by an older agent)
+// reports neither check as passed.
 func (s *ImageStore) Checked(version string) *api.BenchmarkImage {
 	if !versionRe.MatchString(version) {
 		return nil
 	}
-	fi, err := os.Stat(s.path(version))
-	if err != nil {
+	if _, err := os.Stat(s.path(version)); err != nil {
 		return nil
 	}
-	return &api.BenchmarkImage{Version: version, SHA256OK: true, SignatureOK: s.Verify != nil, ReadyAt: fi.ModTime().UTC().Format(time.RFC3339)}
+	out := &api.BenchmarkImage{Version: version}
+	if b, err := os.ReadFile(s.checkedPath(version)); err == nil {
+		var rec api.BenchmarkImage
+		if json.Unmarshal(b, &rec) == nil && rec.Version == version {
+			out = &rec
+		}
+	}
+	return out
 }
 
 type flight struct {
@@ -167,6 +174,9 @@ func (s *ImageStore) prune(keep string) {
 	ents, _ := os.ReadDir(s.Dir)
 	for _, e := range ents {
 		v, ok := strings.CutSuffix(e.Name(), ".qcow2")
+		if !ok {
+			v, ok = strings.CutSuffix(e.Name(), checkedSuffix)
+		}
 		if !ok || v == keep || used[v] {
 			continue
 		}
@@ -245,8 +255,19 @@ func (s *ImageStore) download(ctx context.Context, img *api.Image) error {
 	if err := os.Chmod(tmp.Name(), 0o444); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path(img.Version))
+	if err := os.Rename(tmp.Name(), s.path(img.Version)); err != nil {
+		return err
+	}
+	// What was checked, for this file: the benchmark reports it.
+	rec, _ := json.Marshal(api.BenchmarkImage{Version: img.Version, SHA256OK: true, SignatureOK: s.Verify != nil, ReadyAt: time.Now().UTC().Format(time.RFC3339)})
+	return os.WriteFile(s.checkedPath(img.Version), rec, 0o444)
 }
+
+func (s *ImageStore) checkedPath(version string) string {
+	return filepath.Join(s.Dir, version+checkedSuffix)
+}
+
+const checkedSuffix = ".checked.json"
 
 // selfContained refuses an image that is not a plain qcow2: a backing file
 // or an external data file in its header could point QEMU at host disks.

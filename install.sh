@@ -115,7 +115,7 @@ read_token() {
 		# Other users must not be able to read (or swap) the token.
 		perm=$(stat -L -c '%u %a' "$TOKEN_FILE")
 		case "$perm" in
-			"0 "[0-7]00 | "0 "[0-7]) ;;
+			"0 "[0-7]00 | "0 0") ;;
 			*) die "--token-file $TOKEN_FILE must be owned by root and readable by root only: chown root $TOKEN_FILE && chmod 600 $TOKEN_FILE" ;;
 		esac
 		TOKEN=$(sed -n '1{s/[[:space:]]//g;p;}' "$TOKEN_FILE")
@@ -382,7 +382,13 @@ register() {
 	[ -n "$GPUS" ] && set -- "$@" --gpus "$GPUS"
 	[ -n "$DATA_DIR" ] && set -- "$@" --data-dir "$DATA_DIR"
 	[ -n "$API" ] && set -- "$@" --api "$API"
-	RUNCRATE_HOST_TOKEN="$TOKEN" "$BIN" "$@"
+	# A token file goes to the agent by name: it opens it, then checks the
+	# open file's owner and mode, which a swap after our check can't fool.
+	if [ -n "$TOKEN_FILE" ]; then
+		"$BIN" "$@" --token-file "$TOKEN_FILE"
+	else
+		RUNCRATE_HOST_TOKEN="$TOKEN" "$BIN" "$@"
+	fi
 	"$BIN" bind-gpus || die "could not move the GPUs to vfio-pci (see above). Nothing else is changed; fix it and run again."
 }
 

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
 )
@@ -78,12 +80,13 @@ func dedupe(in []string, max int) []string {
 func isolationScript(t IsolationTargets) string {
 	var b strings.Builder
 	b.WriteString(`iso="$out/iso.txt"; : > "$iso"
-# Exit 0 = connected; anything else (refused, dropped, timed out) = closed.
+# The firewall drops (never rejects), so only a timeout (124) means it
+# held: 0 connected, and a refusal or unreachable means the packet got past it.
 tcp() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 # must NAME DETAIL CMD...: passes when CMD succeeds.
 must() { n=$1; d=$2; shift 2; if "$@" >/dev/null 2>&1; then r=true; s=works; else r=false; s=failed; fi; printf '%s\t%s\t%s: %s\n' "$n" "$r" "$d" "$s" >> "$iso"; }
-# closed NAME DETAIL HOST:PORT...: passes when none of them connects.
-closed() { n=$1; d=$2; shift 2; o=""; for hp in "$@"; do tcp "${hp%:*}" "${hp##*:}" && o="$o $hp"; done; if [ -z "$o" ]; then printf '%s\ttrue\t%s: all closed\n' "$n" "$d" >> "$iso"; else printf '%s\tfalse\t%s: connected to%s\n' "$n" "$d" "$o" >> "$iso"; fi; }
+# closed NAME DETAIL HOST:PORT...: passes when every one of them times out.
+closed() { n=$1; d=$2; shift 2; o=""; for hp in "$@"; do tcp "${hp%:*}" "${hp##*:}"; c=$?; case $c in 124) ;; 0) o="$o $hp(connected)" ;; *) o="$o $hp(answered)" ;; esac; done; if [ -z "$o" ]; then printf '%s\ttrue\t%s: all dropped\n' "$n" "$d" >> "$iso"; else printf '%s\tfalse\t%s: reached%s\n' "$n" "$d" "$o" >> "$iso"; fi; }
 gw=$(ip route | awk '/^default/ {print $3; exit}')
 must egress "https://www.runcrate.ai" curl -sS -m 8 -o /dev/null https://www.runcrate.ai
 must dns "resolve www.runcrate.ai" getent hosts www.runcrate.ai
@@ -104,7 +107,7 @@ must metadata "169.254.169.254" curl -sS -m 4 -o /dev/null http://169.254.169.25
 			fmt.Fprintf(&b, "closed %s %q %s\n", name, detail, strings.Join(hp, " "))
 		}
 	}
-	closed("host_ip", "the host's own addresses", t.HostIPs, 22)
+	closed("host_ip", "the host's own addresses", t.HostIPs, 22, MetadataPort)
 	closed("host_lan_gateway", "the host's default gateway", t.Gateways, 22, 80, 443)
 	if t.DockerBridge != "" {
 		closed("docker_bridge", "the Docker bridge", []string{t.DockerBridge}, 22)
@@ -129,16 +132,22 @@ const (
 
 // LANToVM checks that a machine on the host's LAN can't open a connection
 // to the VM at guestIP: a throwaway namespace routed through the host, like
-// a LAN neighbour using it as a router, tries guestIP:22.
+// a LAN neighbour using it as a router, tries guestIP:22. It first waits
+// until the host itself gets an answer from guestIP:22 (connected or
+// refused): before the guest's network is up, no answer proves nothing.
 func (n *Network) LANToVM(ctx context.Context, guestIP string) api.IsolationCheck {
 	c := api.IsolationCheck{Name: "lan_to_vm"}
 	if ip := net.ParseIP(guestIP); ip == nil || ip.To4() == nil {
 		c.Detail = "no VM address"
 		return c
 	}
+	if !guestAnswers(ctx, net.JoinHostPort(guestIP, "22"), lanProbeWait) {
+		c.Detail = fmt.Sprintf("inconclusive: %s:22 never answered the host itself", guestIP)
+		return c
+	}
 	ns, host, peer := lanProbeNS, lanProbeVeth+"0", lanProbeVeth+"1"
-	_, _ = n.Run.Run(ctx, "ip", "netns", "del", ns) // a leftover from a crash
-	defer func() { _, _ = n.Run.Run(context.WithoutCancel(ctx), "ip", "netns", "del", ns) }()
+	n.dropLANProbe(ctx) // a leftover from a crash
+	defer n.dropLANProbe(context.WithoutCancel(ctx))
 	for _, args := range [][]string{
 		{"netns", "add", ns},
 		{"link", "add", host, "type", "veth", "peer", "name", peer, "netns", ns},
@@ -180,6 +189,40 @@ func (n *Network) LANToVM(ctx context.Context, guestIP string) api.IsolationChec
 		c.Detail = fmt.Sprintf("a LAN machine routed through the host got no answer from %s:22", guestIP)
 	}
 	return c
+}
+
+// lanProbeWait bounds the wait for the guest's network (it boots, then
+// cloud-init brings the network up before the benchmark script runs).
+var lanProbeWait = 5 * time.Minute
+
+// guestAnswers dials addr until it connects or is refused (the guest's
+// network is up and answering), or wait runs out.
+func guestAnswers(ctx context.Context, addr string, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		d := net.Dialer{Timeout: 3 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+// dropLANProbe deletes the probe namespace (and with it the veth pair).
+func (n *Network) dropLANProbe(ctx context.Context) {
+	_, _ = n.Run.Run(ctx, "ip", "netns", "del", lanProbeNS)
 }
 
 func clipDetail(s string) string {

@@ -206,6 +206,7 @@ func hostNetworks(procRoot string) []string {
 func (n *Network) Setup(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.dropLANProbe(ctx) // left by an agent that died mid-benchmark
 	if err := n.apply(ctx); err != nil {
 		if n.ForwardWasOff {
 			_ = n.sysctl("net.ipv4.ip_forward", "0")
@@ -417,6 +418,7 @@ func (n *Network) UpTap(ctx context.Context, name string) error {
 
 // Teardown removes everything Setup and AddTap made. Used by uninstall.
 func (n *Network) Teardown(ctx context.Context) {
+	n.dropLANProbe(ctx)
 	for _, t := range n.taps() {
 		n.DelTap(ctx, t)
 	}
