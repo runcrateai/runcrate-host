@@ -106,6 +106,20 @@ func (s *ImageStore) Local(ctx context.Context, version string) (string, string,
 	return s.Ensure(ctx, "")
 }
 
+// Checked describes a local image version: an image only lands on disk after
+// its sha256 matched (and its signature verified, when Verify is set), so
+// being here is the proof; ready_at is when the download finished.
+func (s *ImageStore) Checked(version string) *api.BenchmarkImage {
+	if !versionRe.MatchString(version) {
+		return nil
+	}
+	fi, err := os.Stat(s.path(version))
+	if err != nil {
+		return nil
+	}
+	return &api.BenchmarkImage{Version: version, SHA256OK: true, SignatureOK: s.Verify != nil, ReadyAt: fi.ModTime().UTC().Format(time.RFC3339)}
+}
+
 type flight struct {
 	done chan struct{}
 	err  error

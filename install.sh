@@ -26,7 +26,9 @@ VM_USER=runcrate-vm
 # The agent carries the same key for its own updates and VM images.
 RELEASE_PUBKEY=MCowBQYDK2VwAyEAYBrMXteHsZh26jJMcMZ3PI05QmTbNcd7gy9ALNlW2Yc=
 
-TOKEN="${RUNCRATE_HOST_TOKEN:-}"
+# The registration token never goes on a command line (where every user on the
+# machine can read it in ps): it comes from a root-only file or a hidden prompt.
+TOKEN=""
 TOKEN_FILE=""
 HOST_NAME=""
 SITE=""
@@ -53,9 +55,8 @@ usage() {
 	cat <<'EOF'
 Runcrate host installer
 
-  --token-file F  read the registration token from file F (first line)
-  --token T       the registration token itself (visible to other users in ps;
-                  prefer --token-file, or leave both out to be asked for it)
+  --token-file F  read the registration token from file F (first line); F must be
+                  owned by root and readable by root only (chmod 600)
   --name N        host name shown in your dashboard (default: hostname)
   --site S        site name, to group hosts in one location
   --gpus LIST     only these GPUs, as PCI addresses (0000:41:00.0,0000:42:00.0); default: all NVIDIA GPUs
@@ -72,7 +73,7 @@ EOF
 parse_args() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			--token) TOKEN="${2:-}"; shift 2 ;;
+			--token) die "--token is gone: the token would show in ps. Put it in a root-only file and pass --token-file, or leave it out to be asked for it" ;;
 			--token-file) TOKEN_FILE="${2:-}"; shift 2 ;;
 			--name) HOST_NAME="${2:-}"; shift 2 ;;
 			--site) SITE="${2:-}"; shift 2 ;;
@@ -101,8 +102,8 @@ ask() {
 	case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-# read_token: from --token-file, --token / RUNCRATE_HOST_TOKEN, or a hidden
-# prompt. Not needed when this machine is already registered.
+# read_token: from --token-file or a hidden prompt. Not needed when this
+# machine is already registered.
 read_token() {
 	if [ -n "$TOKEN_FILE" ]; then
 		[ -f "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ] || die "can't read --token-file $TOKEN_FILE"
@@ -110,7 +111,12 @@ read_token() {
 		[ -n "$TOKEN" ] || die "--token-file $TOKEN_FILE is empty"
 		return 0
 	fi
-	[ -n "$TOKEN" ] && return 0
+		# Other users must not be able to read (or swap) the token.
+		perm=$(stat -L -c '%u %a' "$TOKEN_FILE")
+		case "$perm" in
+			"0 "[0-7]00 | "0 "[0-7]) ;;
+			*) die "--token-file $TOKEN_FILE must be owned by root and readable by root only: chown root $TOKEN_FILE && chmod 600 $TOKEN_FILE" ;;
+		esac
 	[ -f "$CONF_DIR/credential" ] && return 0
 	if has_tty; then
 		printf 'Registration token (from your Runcrate partner dashboard): ' > /dev/tty
@@ -120,7 +126,7 @@ read_token() {
 		printf '\n' > /dev/tty
 		TOKEN=$(printf '%s' "$TOKEN" | tr -d '[:space:]')
 	fi
-	[ -n "$TOKEN" ] || { usage; die "a registration token is required: --token-file, the prompt, or --token"; }
+	[ -n "$TOKEN" ] || { usage; die "a registration token is required: --token-file, or run it in a terminal to be asked"; }
 }
 
 # data_dir: the VM data directory from the agent's config, or the default.

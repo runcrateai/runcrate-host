@@ -6,7 +6,14 @@ Plug your GPU machines into Runcrate with one command. Runcrate sells their GPUs
 curl -fsSL https://get.runcrate.ai/host | sudo sh
 ```
 
-It asks for the registration token from your Runcrate partner dashboard (input hidden). One token can register every machine in a cluster. For unattended installs, put the token in a root-only file and pass `--token-file /root/runcrate-token`.
+It asks for the registration token from your Runcrate partner dashboard (input hidden). One token can register every machine in a cluster. The token never goes on a command line, where every user of the machine could read it in `ps`. For unattended installs, put it in a file only root can read and pass that:
+
+```sh
+sudo sh -c 'umask 077; cat > /root/runcrate-token'    # paste the token, Enter, then Ctrl-D
+curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --token-file /root/runcrate-token
+```
+
+The installer refuses a token file that is not owned by root or that anyone else can read.
 
 ## Requirements
 
@@ -42,7 +49,7 @@ The agent calls Runcrate every 10 seconds over HTTPS with the host's state (VMs,
 | `destroy_vm` | Stops the VM, overwrites its disk with zeros and deletes it, then boots a throwaway VM that overwrites the GPUs' memory before they can be rented again. |
 | `reclaim_notice` | Spot only: tells the VM it will be reclaimed (see below). |
 | `drain` | Takes no new rentals; running ones finish. |
-| `benchmark` | Boots a throwaway VM that tests every free GPU (a memory test over nearly all VRAM, an FP16 matrix multiply checked against the CPU, `nvidia-smi`), and measures disk, internet and, for hosts on the same site, host-to-host bandwidth (iperf3, and ib_write_bw with InfiniBand). |
+| `benchmark` | Boots a throwaway VM that tests every free GPU (a memory test over nearly all VRAM, an FP16 matrix multiply checked against the CPU, `nvidia-smi`), and measures disk, internet and, for hosts on the same site, host-to-host bandwidth (iperf3, and ib_write_bw with InfiniBand). The same VM checks its isolation: it must reach the internet, DNS and the metadata server, and must not reach this host, its gateway, the Docker bridge, private ranges, CGNAT or link-local addresses. Meanwhile the host checks from a throwaway network namespace that a machine on your LAN, routing through it, can't connect to the VM. The results, and the VM image's checks, show on the host's page. |
 | `update_agent` | Downloads a new agent over HTTPS, checks its sha256, swaps it in and restarts. The previous binary stays at `/usr/local/bin/runcrate-host.prev`. |
 
 Customer VMs are isolated from your network and from each other:

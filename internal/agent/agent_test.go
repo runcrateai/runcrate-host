@@ -185,11 +185,15 @@ func (v *fakeVMs) Hold(g []int) {
 	}
 }
 
-func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error) {
+func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(context.Context, string)) ([]byte, string, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.ephemeral = append(v.ephemeral, id)
-	return v.ephOut, v.ephErr
+	out, err := v.ephOut, v.ephErr
+	v.mu.Unlock()
+	if during != nil {
+		during(ctx, "10.254.0.2")
+	}
+	return out, "20261026-1", err
 }
 
 type fakeHost struct{}

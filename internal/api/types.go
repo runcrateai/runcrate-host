@@ -168,6 +168,31 @@ type BenchmarkRequest struct {
 	Disk      DiskBench      `json:"disk"`
 	Net       NetBench       `json:"net"`
 	Topology  Topology       `json:"topology"`
+	// Image is the VM image the benchmark VM booted, with its checks.
+	Image *BenchmarkImage `json:"image,omitempty"`
+	// Isolation is what the benchmark VM could and could not reach.
+	Isolation *Isolation `json:"isolation,omitempty"`
+}
+
+// BenchmarkImage is a base image on the host and how it was checked.
+type BenchmarkImage struct {
+	Version     string `json:"version"`
+	SHA256OK    bool   `json:"sha256_ok"`
+	SignatureOK bool   `json:"signature_ok"`
+	ReadyAt     string `json:"ready_at"` // RFC 3339
+}
+
+// Isolation is the benchmark's network isolation checks (at most 32).
+type Isolation struct {
+	Checks []IsolationCheck `json:"checks"`
+}
+
+// IsolationCheck is one check: a stable snake_case name (at most 64
+// characters), whether it passed, and what was seen (at most 200).
+type IsolationCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // BenchmarkResponse is the answer to POST /benchmark.

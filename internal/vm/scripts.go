@@ -44,8 +44,13 @@ sync
 poweroff
 `
 
-// BenchScript tests every GPU and gathers nvidia-smi and the NVLink topology.
-const BenchScript = ephemeralPrelude + `
+// BenchScript runs the isolation checks (see isolationScript), tests every
+// GPU and gathers nvidia-smi and the NVLink topology.
+func BenchScript(t IsolationTargets) string {
+	return ephemeralPrelude + isolationScript(t) + benchGPUs
+}
+
+const benchGPUs = `
 /usr/local/bin/rc-gpubench > "$out/gpus.json" 2> "$out/err.txt" || true
 nvidia-smi -q > "$out/smi.txt" 2>&1 || true
 nvidia-smi topo -m > "$out/topo.txt" 2>&1 || true
@@ -74,6 +79,12 @@ g["gpus"] = per
 g["topo"] = rd("topo.txt", 20000)
 g["nvlink"] = rd("nvlink.txt", 50000)
 g["stderr"] = rd("err.txt", 4000)
+iso = []
+for line in rd("iso.txt", 20000).splitlines():
+    f = line.split("\t", 2)
+    if len(f) == 3:
+        iso.append({"name": f[0][:64], "ok": f[1] == "true", "detail": f[2][:200]})
+g["isolation"] = iso[:32]
 print(json.dumps(g))
 PY
 post "$out/result.json"

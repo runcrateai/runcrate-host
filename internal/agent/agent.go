@@ -36,7 +36,20 @@ type VMs interface {
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
 	Hold(gpus []int)
-	RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error)
+	RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error)
+}
+
+// Isolation is the host side of the benchmark's isolation checks.
+type Isolation interface {
+	// IsolationTargets are host addresses the benchmark VM must not reach.
+	IsolationTargets() vm.IsolationTargets
+	// LANToVM checks a LAN machine can't open a connection to the VM.
+	LANToVM(ctx context.Context, guestIP string) api.IsolationCheck
+}
+
+// Images describes a local base image and how it was checked (nil: none).
+type Images interface {
+	Checked(version string) *api.BenchmarkImage
 }
 
 // Host reads the machine.
@@ -78,6 +91,10 @@ type Agent struct {
 	// benchmark VM boots without GPUs, so each GPU is reported as the host
 	// sees it (name, UUID, VRAM) with its checks marked passed.
 	DevGPUs func(index int) (name, uuid string, vramGB int)
+	// Isolation and Images feed the benchmark's isolation checks and image
+	// report; either may be nil (the report then leaves that part out).
+	Isolation Isolation
+	Images    Images
 
 	interval time.Duration
 	flushMu  sync.Mutex
@@ -442,12 +459,30 @@ type vmGPU struct {
 }
 
 type vmBench struct {
-	OK     bool    `json:"ok"`
-	Error  string  `json:"error"`
-	GPUs   []vmGPU `json:"gpus"`
-	Topo   string  `json:"topo"`
-	NVLink string  `json:"nvlink"`
-	Stderr string  `json:"stderr"`
+	OK        bool                 `json:"ok"`
+	Error     string               `json:"error"`
+	GPUs      []vmGPU              `json:"gpus"`
+	Topo      string               `json:"topo"`
+	NVLink    string               `json:"nvlink"`
+	Stderr    string               `json:"stderr"`
+	Isolation []api.IsolationCheck `json:"isolation"`
+}
+
+// isolationChecks merges the VM's checks with the host's LAN probe, bounded
+// to what the control plane stores (32 checks, names 64, details 200).
+func isolationChecks(fromVM []api.IsolationCheck, lan *api.IsolationCheck) []api.IsolationCheck {
+	all := fromVM
+	if lan != nil {
+		all = append(all[:len(all):len(all)], *lan)
+	}
+	var out []api.IsolationCheck
+	for _, c := range all {
+		if c.Name == "" || len(out) == 32 {
+			continue
+		}
+		out = append(out, api.IsolationCheck{Name: clip(c.Name, 64), OK: c.OK, Detail: clip(c.Detail, 200)})
+	}
+	return out
 }
 
 // benchmark runs the GPU checks in a throwaway VM while the host measures
@@ -470,7 +505,20 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	var gpuErr string
 	var passed, failed []int
 	if len(free) > 0 {
-		out, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", free, vm.BenchScript, 30*time.Minute)
+		var targets vm.IsolationTargets
+		var during func(context.Context, string)
+		var lan *api.IsolationCheck
+		if a.Isolation != nil {
+			targets = a.Isolation.IsolationTargets()
+			during = func(ctx context.Context, guestIP string) {
+				c := a.Isolation.LANToVM(ctx, guestIP)
+				lan = &c
+			}
+		}
+		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", free, vm.BenchScript(targets), 30*time.Minute, during)
+		if a.Images != nil && image != "" {
+			req.Image = a.Images.Checked(image)
+		}
 		var vb vmBench
 		switch {
 		case err != nil:
@@ -480,6 +528,9 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		}
 		if vb.Error != "" {
 			gpuErr = vb.Error
+		}
+		if checks := isolationChecks(vb.Isolation, lan); len(checks) > 0 {
+			req.Isolation = &api.Isolation{Checks: checks}
 		}
 		if a.DevGPUs != nil && err == nil {
 			// The VM booted and ran the script; there are no GPUs in it.

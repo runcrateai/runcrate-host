@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -44,7 +45,9 @@ const exitUnauthorized = 3
 const usage = `runcrate-host: plug this machine's GPUs into Runcrate.
 
 Usage:
-  runcrate-host register --token <registration token> [--name N] [--site S] [--gpus 0000:41:00.0,...] [--data-dir D] [--api URL]
+  runcrate-host register --token-file F [--name N] [--site S] [--gpus 0000:41:00.0,...] [--data-dir D] [--api URL]
+                                     F is a root-only file (or - for stdin); RUNCRATE_HOST_TOKEN works too.
+                                     The token is never taken on the command line, where ps shows it.
   runcrate-host run                  the agent (systemd runs this)
   runcrate-host status               config, GPUs and VMs on this host
   runcrate-host snapshot-gpus        record GPU names, VRAM and UUIDs while the host driver still has them
@@ -209,7 +212,7 @@ func releaseGPUs(cfg *config.Config) error {
 
 func cmdRegister(ctx context.Context, dir string, args []string) error {
 	fs := flag.NewFlagSet("register", flag.ContinueOnError)
-	token := fs.String("token", os.Getenv("RUNCRATE_HOST_TOKEN"), "registration token (or RUNCRATE_HOST_TOKEN)")
+	tokenFile := fs.String("token-file", "", "file holding the registration token, readable by its owner only (- for stdin)")
 	name := fs.String("name", "", "host name shown to you in Runcrate (default: hostname)")
 	site := fs.String("site", "", "site name, to group hosts in one location")
 	gpus := fs.String("gpus", "", "comma-separated PCI addresses to give Runcrate (default: every NVIDIA GPU)")
@@ -233,8 +236,9 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 		// Claims (or migrates) the data directory of an existing install.
 		return config.ClaimDataDir(cfg.DataDir, true)
 	}
-	if *token == "" {
-		return errors.New("--token is required")
+	token, err := readToken(*tokenFile, os.Stdin)
+	if err != nil {
+		return err
 	}
 	if *name != "" {
 		cfg.Name = *name
@@ -299,7 +303,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	}
 	usableDisk := max(int64(free>>30)-vm.ReserveDiskGB-vm.ImageAllowanceGB, 0)
 	req := api.RegisterRequest{
-		RegistrationToken: *token,
+		RegistrationToken: token,
 		RequestID:         registerRequestID(cfg),
 		Host: api.RegisterHost{
 			Name: cfg.Name,
@@ -363,6 +367,55 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	return nil
 }
 
+// readToken gets the registration token from a file only its owner can read,
+// stdin ("-"), or RUNCRATE_HOST_TOKEN, never from argv, which any user on the
+// machine sees in ps.
+func readToken(path string, stdin io.Reader) (string, error) {
+	var raw []byte
+	switch path {
+	case "":
+		raw = []byte(os.Getenv("RUNCRATE_HOST_TOKEN"))
+	case "-":
+		b, err := io.ReadAll(io.LimitReader(stdin, 4096))
+		if err != nil {
+			return "", fmt.Errorf("read the token from stdin: %w", err)
+		}
+		raw = b
+	default:
+		f, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("--token-file: %w", err)
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			return "", fmt.Errorf("--token-file: %w", err)
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 || !ok || int(sys.Uid) != os.Geteuid() {
+			return "", fmt.Errorf("--token-file %s must be a file owned by %s and readable by it only (chmod 600 %s)", path, currentUser(), path)
+		}
+		b, err := io.ReadAll(io.LimitReader(f, 4096))
+		if err != nil {
+			return "", fmt.Errorf("--token-file: %w", err)
+		}
+		raw = b
+	}
+	line, _, _ := strings.Cut(string(raw), "\n")
+	token := strings.TrimSpace(line)
+	if token == "" {
+		return "", errors.New("a registration token is required: --token-file F (a root-only file, or - for stdin) or RUNCRATE_HOST_TOKEN")
+	}
+	return token, nil
+}
+
+func currentUser() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return "uid " + fmt.Sprint(os.Geteuid())
+}
+
 // registerRequestID is stable until registration succeeds, so a retry after
 // a lost answer registers the same host instead of a second one.
 func registerRequestID(cfg *config.Config) string {
@@ -380,6 +433,7 @@ type runtime struct {
 	net    *vm.Network
 	meta   *metadata.Server
 	mgr    *vm.Manager
+	images *vm.ImageStore
 	host   *host
 	client *api.Client
 }
@@ -409,19 +463,20 @@ func buildRuntime(cfg *config.Config, log *slog.Logger, cred string) (*runtime, 
 	run := sysexec.Exec{}
 	n := &vm.Network{Subnet: subnet, ForwardWasOff: cfg.ForwardWasOff, Blocked: cfg.BlockedCIDRs, Run: run, ProcRoot: "/"}
 	meta := metadata.New(subnet)
+	images := &vm.ImageStore{Dir: filepath.Join(cfg.DataDir, "images"), API: client, Run: run,
+		Verify: func(ctx context.Context, img *api.Image) error {
+			return release.Fetch(ctx, nil, release.KindImage, img.Version, img.SHA256, img.URL)
+		}}
 	mgr := &vm.Manager{
 		DataDir: cfg.DataDir, Net: n, Meta: meta, Run: run, Sys: hw.Host, VFIO: vfio.Sysfs{Root: "/"},
-		Images: &vm.ImageStore{Dir: filepath.Join(cfg.DataDir, "images"), API: client, Run: run,
-			Verify: func(ctx context.Context, img *api.Image) error {
-				return release.Fetch(ctx, nil, release.KindImage, img.Version, img.SHA256, img.URL)
-			}},
+		Images:   images,
 		QemuUser: qemuUser,
 		Firmware: fw, Log: log, GPUs: gpus, NVSwitches: sw,
 		HostThreads: threads, HostRAMGB: int(total >> 30), Scrub: cfg.ScrubGPUs && !devmode.NoPassthrough(),
 		NoPassthrough: devmode.NoPassthrough(),
 	}
 	h := &host{cfg: cfg, sys: hw.Host, gpus: gpus, nvswitches: sw, cacheTopo: cache.Topo, subnet: subnet, speed: bench.DefaultSpeedTest, mgr: mgr}
-	return &runtime{cfg: cfg, net: n, meta: meta, mgr: mgr, host: h, client: client}, nil
+	return &runtime{cfg: cfg, net: n, meta: meta, mgr: mgr, images: images, host: h, client: client}, nil
 }
 
 func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
@@ -434,7 +489,7 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 		return err
 	}
 	if cred == "" || cfg.HostID == "" {
-		return errors.New("not registered: run `runcrate-host register --token ...` first")
+		return errors.New("not registered: run `runcrate-host register --token-file F` first")
 	}
 	rt, err := buildRuntime(cfg, log, cred)
 	if err != nil {
@@ -521,7 +576,9 @@ func cmdRun(ctx context.Context, dir string, log *slog.Logger) error {
 			}
 			return update.Apply(ctx, nil, u.URL, u.SHA256, self)
 		},
-		Restart: cancel,
+		Restart:   cancel,
+		Isolation: rt.net,
+		Images:    rt.images,
 	}
 	if devmode.NoPassthrough() {
 		a.DevGPUs = rt.host.GPUIdentity

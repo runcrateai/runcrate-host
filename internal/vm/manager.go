@@ -1044,7 +1044,7 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		id := fmt.Sprintf("scrub-%s-%d", hex.EncodeToString(hash(after))[:10], time.Now().UnixNano()%1e9)
 		rctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		var out []byte
-		out, err = m.RunEphemeral(rctx, id, owner, gpus, ScrubScript, 15*time.Minute)
+		out, _, err = m.RunEphemeral(rctx, id, owner, gpus, ScrubScript, 15*time.Minute, nil)
 		cancel()
 		if ctx.Err() != nil {
 			return // shutting down: marker kept
@@ -1133,17 +1133,19 @@ func (m *Manager) ClearHold(gpus []int) {
 }
 
 // RunEphemeral boots a throwaway VM on gpus that runs script, waits for it
-// to post its JSON result to the metadata server, and destroys it.
-func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration) ([]byte, error) {
+// to post its JSON result to the metadata server, and destroys it. during,
+// when set, runs alongside with the VM's address (the host side of a check).
+// It returns the result and the base image version the VM booted.
+func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error) {
 	if !ValidID(id) {
-		return nil, fmt.Errorf("bad id %q", id)
+		return nil, "", fmt.Errorf("bad id %q", id)
 	}
 	m.mu.Lock()
 	m.init()
 	_, exists := m.vms[id]
 	m.mu.Unlock()
 	if exists {
-		return nil, fmt.Errorf("throwaway vm %s already exists", id)
+		return nil, "", fmt.Errorf("throwaway vm %s already exists", id)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -1156,17 +1158,24 @@ func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int
 		ram = max(4, m.HostRAMGB-reserveRAMGB)
 	}
 	if _, err := m.Create(ctx, Spec{ID: id, GPUIndexes: gpus, VCPUs: vcpus, RAMGB: ram, CloudInit: script, Ephemeral: true, Owner: owner}); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = m.Destroy(context.WithoutCancel(ctx), id) }()
 	m.mu.Lock()
-	ip := m.vms[id].GuestIP
+	ip, image := m.vms[id].GuestIP, m.vms[id].ImageVersion
 	m.mu.Unlock()
-	out, err := m.Meta.Result(ctx, ip)
-	if err != nil {
-		return nil, fmt.Errorf("throwaway vm gave no result: %w", err)
+	done := make(chan struct{})
+	if during != nil {
+		go func() { defer close(done); during(ctx, ip) }()
+	} else {
+		close(done)
 	}
-	return out, nil
+	out, err := m.Meta.Result(ctx, ip)
+	<-done
+	if err != nil {
+		return nil, image, fmt.Errorf("throwaway vm gave no result: %w", err)
+	}
+	return out, image, nil
 }
 
 // Wait waits for background wipes and scrubs (shutdown, tests).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/runcrateai/runcrate-host/internal/config"
@@ -37,5 +38,29 @@ func TestRegisterAlreadyRegisteredClaimsDataDir(t *testing.T) {
 	}
 	if !config.OwnsDataDir(data) {
 		t.Fatal("register on a registered host left the data directory unclaimed")
+	}
+}
+
+// The token file must be private to its owner: a group- or world-readable
+// one is refused, since another user could have read (or written) it.
+func TestReadTokenRefusesSharedFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(p, []byte("rcp_reg_abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o640); err != nil { // not subject to the umask
+		t.Fatal(err)
+	}
+	if _, err := readToken(p, nil); err == nil {
+		t.Fatal("a group-readable token file was accepted")
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tok, err := readToken(p, nil); err != nil || tok != "rcp_reg_abc" {
+		t.Fatalf("0600 token file: %q, %v", tok, err)
+	}
+	if tok, err := readToken("-", strings.NewReader("  rcp_reg_stdin \nignored\n")); err != nil || tok != "rcp_reg_stdin" {
+		t.Fatalf("stdin token: %q, %v", tok, err)
 	}
 }
