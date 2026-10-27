@@ -57,7 +57,12 @@ esac
 
 echo "==> Building runcrate-host $V from $commit"
 make -s clean release VERSION="$V"
-go version -m "out/$ASSET" | grep -q -- "-X main.version=$V" || die "out/$ASSET was not built with version $V"
+# -trimpath leaves -ldflags out of the build info, so the version itself is
+# checked by install.sh (`runcrate-host version` must print it); here, check
+# the binary was built from this clean commit.
+go version -m "out/$ASSET" | grep -q "vcs.revision=$commit" &&
+	go version -m "out/$ASSET" | grep -q 'vcs.modified=false' ||
+	die "out/$ASSET was not built from a clean $commit"
 cp install.sh out/host
 printf '%s\n' "$V" > out/host.version
 
