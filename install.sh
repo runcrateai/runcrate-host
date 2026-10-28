@@ -23,6 +23,11 @@ UNIT_DIR=/etc/systemd/system
 MODPROBE_CONF=/etc/modprobe.d/runcrate-host-vfio.conf
 MODULES_CONF=/etc/modules-load.d/runcrate-host.conf
 GRUB_CONF=/etc/default/grub.d/90-runcrate-host.cfg
+# The machine's own boot loader settings (read only), and what the running kernel reports.
+GRUB_DEFAULT_FILE=/etc/default/grub
+IOMMU_GROUPS=/sys/kernel/iommu_groups
+KERNEL_CMDLINE=/proc/cmdline
+CPUINFO=/proc/cpuinfo
 UDEV_RULE=/etc/udev/rules.d/90-runcrate-host.rules
 DISABLED_UNITS="$CONF_DIR/disabled-units"
 # QEMU runs as this unprivileged user (group kvm); the agent expects it.
@@ -222,18 +227,44 @@ check_machine() {
 	lspci -d 10de: | grep -E 'VGA|3D' | sed 's/^/  /'
 }
 
+# iommu_param: the kernel parameters this installer adds to turn IOMMU on.
+iommu_param() {
+	if grep -q GenuineIntel "$CPUINFO"; then echo "intel_iommu=on iommu=pt"; else echo "amd_iommu=on iommu=pt"; fi
+}
+
+# keep_iommu_param: IOMMU is on because the kernel booted with our parameters,
+# but their boot loader file is gone (an earlier --uninstall removed it, then
+# the machine was installed again without a reboot). Write it back, or the next
+# reboot boots without IOMMU and no GPU can be passed through. A machine whose
+# own boot loader settings carry the parameters is left alone.
+keep_iommu_param() {
+	param=$(iommu_param)
+	[ -f "$GRUB_CONF" ] && return 0
+	grep -q -- "$param" "$KERNEL_CMDLINE" 2>/dev/null || return 0
+	grep -qs -- "$param" "$GRUB_DEFAULT_FILE" && return 0
+	for f in "$(dirname "$GRUB_CONF")"/*.cfg; do
+		[ -f "$f" ] && grep -qs -- "$param" "$f" && return 0
+	done
+	command -v update-grub >/dev/null 2>&1 || { say "The kernel has '$param' but no boot loader file keeps it: add it to your boot loader, or IOMMU is off after the next reboot."; return 0; }
+	mkdir -p "$(dirname "$GRUB_CONF")"
+	printf '# Written by the Runcrate host installer. Removed by --uninstall.\nGRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT %s"\n' "$param" > "$GRUB_CONF"
+	update-grub >/dev/null 2>&1 || say "update-grub failed; run it yourself so IOMMU stays on after a reboot."
+	say "Kept '$param' in $GRUB_CONF so IOMMU stays on after a reboot."
+}
+
 check_iommu() {
 	step "Checking IOMMU"
-	if [ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+	if [ -n "$(ls -A "$IOMMU_GROUPS" 2>/dev/null)" ]; then
 		say "IOMMU is on."
+		keep_iommu_param
 		return 0
 	fi
 	if [ "$FORCE" -eq 1 ]; then
 		say "IOMMU is off; continuing anyway (--force). No GPU can be passed through until it is on."
 		return 0
 	fi
-	if grep -q GenuineIntel /proc/cpuinfo; then param="intel_iommu=on iommu=pt"; else param="amd_iommu=on iommu=pt"; fi
-	if [ -f "$GRUB_CONF" ] && grep -q "$param" /proc/cmdline; then
+	param=$(iommu_param)
+	if [ -f "$GRUB_CONF" ] && grep -q -- "$param" "$KERNEL_CMDLINE"; then
 		die "the kernel has '$param' but no IOMMU came up: turn on VT-d (Intel) or AMD-Vi/IOMMU in the BIOS, reboot, and run this again"
 	fi
 	say "IOMMU is off. GPU passthrough needs it. This adds to the kernel command line:"
@@ -461,4 +492,5 @@ main() {
 	say "To remove it: curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall"
 }
 
-main "$@"
+# hack/test-install.sh sources this file to test its functions.
+[ "${RUNCRATE_HOST_INSTALL_SOURCED:-}" = 1 ] || main "$@"

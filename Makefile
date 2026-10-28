@@ -5,6 +5,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 test:
 	go test -race ./...
+	sh hack/test-install.sh
 
 release:
 	mkdir -p out
