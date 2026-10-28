@@ -241,15 +241,20 @@ keep_iommu_param() {
 	param=$(iommu_param)
 	[ -f "$GRUB_CONF" ] && return 0
 	grep -q -- "$param" "$KERNEL_CMDLINE" 2>/dev/null || return 0
-	grep -qs -- "$param" "$GRUB_DEFAULT_FILE" && return 0
-	for f in "$(dirname "$GRUB_CONF")"/*.cfg; do
-		[ -f "$f" ] && grep -qs -- "$param" "$f" && return 0
+	# The owner's own settings keep it when every parameter is on a line that is not a comment.
+	kept=1
+	for p in $param; do
+		grep -hsv '^[[:space:]]*#' "$GRUB_DEFAULT_FILE" "$(dirname "$GRUB_CONF")"/*.cfg | grep -q -- "$p" || kept=0
 	done
+	[ "$kept" -eq 1 ] && return 0
 	command -v update-grub >/dev/null 2>&1 || { say "The kernel has '$param' but no boot loader file keeps it: add it to your boot loader, or IOMMU is off after the next reboot."; return 0; }
 	mkdir -p "$(dirname "$GRUB_CONF")"
 	printf '# Written by the Runcrate host installer. Removed by --uninstall.\nGRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT %s"\n' "$param" > "$GRUB_CONF"
-	update-grub >/dev/null 2>&1 || say "update-grub failed; run it yourself so IOMMU stays on after a reboot."
-	say "Kept '$param' in $GRUB_CONF so IOMMU stays on after a reboot."
+	if update-grub >/dev/null; then
+		say "Kept '$param' in $GRUB_CONF so IOMMU stays on after a reboot."
+	else
+		say "update-grub failed (see above): run it yourself, or IOMMU is off after the next reboot."
+	fi
 }
 
 check_iommu() {
@@ -492,5 +497,9 @@ main() {
 	say "To remove it: curl -fsSL https://get.runcrate.ai/host | sudo sh -s -- --uninstall"
 }
 
-# hack/test-install.sh sources this file to test its functions.
-[ "${RUNCRATE_HOST_INSTALL_SOURCED:-}" = 1 ] || main "$@"
+# hack/test-install.sh sources this file to test its functions; $0 is then the test's own path,
+# which no inherited environment variable can fake.
+case "$0" in
+*/test-install.sh | test-install.sh) ;;
+*) main "$@" ;;
+esac

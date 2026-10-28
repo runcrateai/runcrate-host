@@ -14,7 +14,6 @@ printf '#!/bin/sh\ntouch "%s/update-grub-ran"\n' "$T" > "$T/bin/update-grub"
 chmod +x "$T/bin/update-grub"
 PATH="$T/bin:$PATH"
 
-RUNCRATE_HOST_INSTALL_SOURCED=1
 . "$REPO/install.sh"
 GRUB_CONF="$T/grub.d/90-runcrate-host.cfg"
 GRUB_DEFAULT_FILE="$T/grub"
@@ -53,6 +52,18 @@ echo "BOOT_IMAGE=/vmlinuz intel_iommu=on iommu=pt" > "$KERNEL_CMDLINE"
 echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"' > "$GRUB_DEFAULT_FILE"
 check_iommu
 [ ! -f "$GRUB_CONF" ] || fail "a file was written although /etc/default/grub has the parameters"
+
+# 4b. The owner's settings carry the parameters on separate lines: still left alone.
+reset
+printf 'GRUB_CMDLINE_LINUX="intel_iommu=on"\nGRUB_CMDLINE_LINUX_DEFAULT="iommu=pt  quiet"\n' > "$GRUB_DEFAULT_FILE"
+check_iommu
+[ ! -f "$GRUB_CONF" ] || fail "a file was written although the owner's settings carry both parameters"
+
+# 4c. The parameters are only in a commented-out line: that keeps nothing, so the file is written.
+reset
+echo '#GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"' > "$GRUB_DEFAULT_FILE"
+check_iommu
+[ -f "$GRUB_CONF" ] || fail "a commented-out line was taken as keeping the parameters"
 
 # 5. AMD picks its own parameters.
 reset
