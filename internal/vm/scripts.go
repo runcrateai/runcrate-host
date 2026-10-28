@@ -48,11 +48,11 @@ modes | while IFS=', ' read -r i ec ep mc mp; do
 done
 bad=$(modes | awk -F', ' '($2 != "Enabled" && $2 != "[N/A]") || ($4 != "Disabled" && $4 != "[N/A]") {print "gpu " $1 ": ecc " $2 ", mig " $4}')
 if [ -n "$bad" ]; then
-  printf '{"ok":false,"error":"GPU modes could not be reset: %s"}' "$(echo $bad)" > "$out/result.json"
-  post "$out/result.json"; sync; poweroff; exit 0
+  fail "GPU modes could not be reset: $(echo $bad)"
 fi
 say scrub
-if ! timeout 1200 /usr/local/bin/rc-gpubench --scrub > "$out/result.json" 2> "$out/err.txt"; then
+# Inside the host's 15 min budget for a scrub VM (the prelude can take 4).
+if ! timeout 480 /usr/local/bin/rc-gpubench --scrub > "$out/result.json" 2> "$out/err.txt"; then
   [ -s "$out/result.json" ] || fail "rc-gpubench --scrub failed or timed out: $(head -c 300 "$out/err.txt")"
 fi
 say posting
@@ -73,10 +73,15 @@ if [ -n "$drv_err" ]; then
   python3 -c 'import json,sys; print(json.dumps({"ok": False, "error": sys.argv[1][:500], "gpus": []}))' "$drv_err" > "$out/gpus.json"
 else
   say gpubench
-  timeout 1200 /usr/local/bin/rc-gpubench > "$out/gpus.json" 2> "$out/err.txt" || true
-  timeout 120 nvidia-smi -q > "$out/smi.txt" 2>&1 || true
-  timeout 120 nvidia-smi topo -m > "$out/topo.txt" 2>&1 || true
-  timeout 120 nvidia-smi nvlink -s > "$out/nvlink.txt" 2>&1 || true
+  # Well inside the host's 30 min budget, so a wedged GPU still reports.
+  timeout 900 /usr/local/bin/rc-gpubench > "$out/gpus.json" 2> "$out/err.txt"
+  if [ $? -eq 124 ]; then
+    python3 -c 'import json; print(json.dumps({"ok": False, "error": "rc-gpubench did not finish in 15 min (a GPU may be hung)", "gpus": []}))' > "$out/gpus.json"
+  else
+    timeout 120 nvidia-smi -q > "$out/smi.txt" 2>&1 || true
+    timeout 120 nvidia-smi topo -m > "$out/topo.txt" 2>&1 || true
+    timeout 120 nvidia-smi nvlink -s > "$out/nvlink.txt" 2>&1 || true
+  fi
 fi
 python3 - "$out" > "$out/result.json" <<'PY'
 import json, sys, subprocess, os
