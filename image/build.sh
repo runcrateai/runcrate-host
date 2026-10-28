@@ -13,7 +13,7 @@
 #                       took nvidia-open 615.71.10, which refuses the H100 PCIe (10de:2331)
 #                       with "not supported by the NVIDIA 615.71.10 driver release". 580
 #                       covers Turing to Blackwell, every GPU we take.
-#   CUDA_VERSION=12-9   pin CUDA (default: newest)
+#   CUDA_VERSION=12-9   pin CUDA (default: the driver branch's CUDA: 570 -> 12-8, 575 -> 12-9, 580 -> 13-0)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -118,13 +118,11 @@ write_files:
       done
       [ -n "\$fm" ] || { echo "no Fabric Manager build for driver \$dver"; exit 1; }
       apt-get install -y "\$fm"
-      # CUDA no newer than the driver: the newest when the driver is the
-      # newest, else the release that shipped with the pinned branch.
+      # CUDA no newer than the driver: the release that shipped with its branch.
       cv="$CUDA_VERSION"
-      if [ -z "\$cv" ] && [ -n "$DRIVER_BRANCH" ]; then
+      if [ -z "\$cv" ]; then
         case "$DRIVER_BRANCH" in 570) cv=12-8 ;; 575) cv=12-9 ;; 580) cv=13-0 ;; *) echo "set CUDA_VERSION for driver $DRIVER_BRANCH"; exit 1 ;; esac
       fi
-      [ -n "\$cv" ] || cv=\$(apt-cache search --names-only '^cuda-nvcc-[0-9]+-[0-9]+\$' | awk '{print \$1}' | sed 's/cuda-nvcc-//' | sort -V | tail -n1)
       apt-get install -y cuda-cudart-\$cv libcublas-\$cv cuda-nvcc-\$cv cuda-cudart-dev-\$cv libcublas-dev-\$cv
       cudadir=/usr/local/cuda-\$(echo \$cv | tr - .)
       # Real code for every GPU generation we take (Turing to Blackwell),

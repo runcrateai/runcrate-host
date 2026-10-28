@@ -11,13 +11,28 @@ mkdir -p "$out"
 post() { curl -fsS --retry 5 --retry-delay 2 --max-time 30 -X POST -H 'Content-Type: application/json' --data-binary @"$1" http://169.254.169.254/runcrate/v1/ephemeral-result; }
 # NVSwitch nodes need Fabric Manager before CUDA can start.
 if lspci -nd 10de: 2>/dev/null | grep -q ' 0680:'; then systemctl start nvidia-fabricmanager.service || true; sleep 10; fi
+# Progress goes to the serial console (runcrate-host console <vm>), so a
+# stuck run shows where it stopped.
+say() { echo "rc-ephemeral: $*" > /dev/ttyS0 2>/dev/null || true; }
+# fail MESSAGE: post {"ok":false,"error":MESSAGE} and power off.
+fail() { python3 -c 'import json,sys; print(json.dumps({"ok": False, "error": sys.argv[1][:500], "gpus": []}))' "$1" > "$out/result.json"; say "failed: $1"; post "$out/result.json"; sync; poweroff; exit 0; }
+say start
 for i in $(seq 90); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
+# A driver that can't take the card (too old, too new for it) is an image
+# problem, not a GPU one: name it, with the kernel's reason.
+drv_err=""
+if ! timeout 60 nvidia-smi -L >/dev/null 2>&1; then
+  why=$(dmesg 2>/dev/null | grep -E 'NVRM: ' | grep -v -E 'NVRM: (Please|in this|specific|README)' | sed 's/^\[[^]]*\] *//' | tr -s ' ' | head -n 4 | tr '\n' ' ')
+  drv_err="the NVIDIA driver in the VM did not start: ${why:-nvidia-smi found no GPU}"
+fi
+say "driver: ${drv_err:-ok}"
 `
 
 // ScrubScript puts back what a tenant may have changed and persists on the
 // card (MIG mode, ECC off, clock locks), then overwrites every GPU's memory
 // with zeros.
 const ScrubScript = ephemeralPrelude + `
+[ -z "$drv_err" ] || fail "$drv_err"
 modes() { nvidia-smi --query-gpu=index,ecc.mode.current,ecc.mode.pending,mig.mode.current,mig.mode.pending --format=csv,noheader 2>/dev/null; }
 n=$(nvidia-smi -L 2>/dev/null | wc -l)
 for i in $(seq 0 $((n - 1))); do
@@ -36,9 +51,11 @@ if [ -n "$bad" ]; then
   printf '{"ok":false,"error":"GPU modes could not be reset: %s"}' "$(echo $bad)" > "$out/result.json"
   post "$out/result.json"; sync; poweroff; exit 0
 fi
-if ! /usr/local/bin/rc-gpubench --scrub > "$out/result.json" 2> "$out/err.txt"; then
-  [ -s "$out/result.json" ] || printf '{"ok":false,"error":"rc-gpubench failed"}' > "$out/result.json"
+say scrub
+if ! timeout 1200 /usr/local/bin/rc-gpubench --scrub > "$out/result.json" 2> "$out/err.txt"; then
+  [ -s "$out/result.json" ] || fail "rc-gpubench --scrub failed or timed out: $(head -c 300 "$out/err.txt")"
 fi
+say posting
 post "$out/result.json"
 sync
 poweroff
@@ -51,10 +68,16 @@ func BenchScript(t IsolationTargets) string {
 }
 
 const benchGPUs = `
-/usr/local/bin/rc-gpubench > "$out/gpus.json" 2> "$out/err.txt" || true
-nvidia-smi -q > "$out/smi.txt" 2>&1 || true
-nvidia-smi topo -m > "$out/topo.txt" 2>&1 || true
-nvidia-smi nvlink -s > "$out/nvlink.txt" 2>&1 || true
+say "isolation checks done"
+if [ -n "$drv_err" ]; then
+  python3 -c 'import json,sys; print(json.dumps({"ok": False, "error": sys.argv[1][:500], "gpus": []}))' "$drv_err" > "$out/gpus.json"
+else
+  say gpubench
+  timeout 1200 /usr/local/bin/rc-gpubench > "$out/gpus.json" 2> "$out/err.txt" || true
+  timeout 120 nvidia-smi -q > "$out/smi.txt" 2>&1 || true
+  timeout 120 nvidia-smi topo -m > "$out/topo.txt" 2>&1 || true
+  timeout 120 nvidia-smi nvlink -s > "$out/nvlink.txt" 2>&1 || true
+fi
 python3 - "$out" > "$out/result.json" <<'PY'
 import json, sys, subprocess, os
 d = sys.argv[1]
@@ -87,7 +110,9 @@ for line in rd("iso.txt", 20000).splitlines():
 g["isolation"] = iso[:32]
 print(json.dumps(g))
 PY
-post "$out/result.json"
+[ -s "$out/result.json" ] || fail "the benchmark result could not be assembled"
+say posting
+post "$out/result.json" || say "post failed"
 sync
 poweroff
 `
