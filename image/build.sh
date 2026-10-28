@@ -26,6 +26,8 @@ OUT="${OUT:-$here/../out}"
 SIZE=16G
 
 case "$VERSION" in *[!A-Za-z0-9._-]*|"") echo "bad version: $VERSION" >&2; exit 1 ;; esac
+case "$DRIVER_BRANCH" in *[!0-9]*|"") echo "bad DRIVER_BRANCH: $DRIVER_BRANCH" >&2; exit 1 ;; esac
+case "$CUDA_VERSION" in "") ;; *[!0-9-]*|-*|*-|*-*-*) echo "bad CUDA_VERSION: $CUDA_VERSION (like 13-0)" >&2; exit 1 ;; *-*) ;; *) echo "bad CUDA_VERSION: $CUDA_VERSION (like 13-0)" >&2; exit 1 ;; esac
 [ -e /dev/kvm ] || { echo "needs KVM (/dev/kvm)" >&2; exit 1; }
 for c in qemu-system-x86_64 qemu-img genisoimage curl sha256sum gpgv; do
 	command -v "$c" >/dev/null || { echo "missing $c (apt install qemu-system-x86 qemu-utils genisoimage curl gpgv ubuntu-cloudimage-keyring)" >&2; exit 1; }
