@@ -9,13 +9,16 @@
 # a signed image: sign it (kind runcrate-vm) and upload the .sig next to it:
 #   RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
 #     go run ./hack/sign -kind runcrate-vm -version <version> out/runcrate-vm-<version>.qcow2
-#   DRIVER_BRANCH=580   pin the driver branch (default: newest nvidia-open)
+#   DRIVER_BRANCH=580   the driver branch (default 580). Never "newest": image 20261026-1
+#                       took nvidia-open 615.71.10, which refuses the H100 PCIe (10de:2331)
+#                       with "not supported by the NVIDIA 615.71.10 driver release". 580
+#                       covers Turing to Blackwell, every GPU we take.
 #   CUDA_VERSION=12-9   pin CUDA (default: newest)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 VERSION="${1:-$(date -u +%Y%m%d)-1}"
-DRIVER_BRANCH="${DRIVER_BRANCH:-}"
+DRIVER_BRANCH="${DRIVER_BRANCH:-580}"
 CUDA_VERSION="${CUDA_VERSION:-}"
 BASE_URL=https://cloud-images.ubuntu.com/releases/noble/release
 BASE=ubuntu-24.04-server-cloudimg-amd64.img
@@ -98,7 +101,7 @@ write_files:
       curl -fsSL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
       dpkg -i /tmp/cuda-keyring.deb
       apt-get update
-      if [ -n "$DRIVER_BRANCH" ]; then apt-get install -y nvidia-open-$DRIVER_BRANCH; else apt-get install -y nvidia-open; fi
+      apt-get install -y nvidia-open-$DRIVER_BRANCH
       # The open kernel module source package is nvidia-kernel-source-open
       # (590 and later) or nvidia-kernel-source-<branch>-open / nvidia-dkms-<branch>-open
       # (570 to 580); take whichever is installed.
