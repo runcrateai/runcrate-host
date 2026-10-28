@@ -201,7 +201,8 @@ uninstall() {
 	step "Done"
 	say "runcrate-host is removed and every GPU is back with the host. The GPUs reach your own"
 	say "driver now (or after a reboot if nothing was loaded). Packages it installed (qemu, ovmf,"
-	say "nftables, iperf3) are left in place. Delist the host in your Runcrate dashboard too."
+	say "nftables, iperf3) are left in place. If the machine is still in your Runcrate dashboard,"
+	say "remove it there too (Hosts, then its menu, Remove)."
 }
 
 check_machine() {
