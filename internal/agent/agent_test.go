@@ -492,7 +492,28 @@ func TestBenchmarkWithAMissingGPUTrustsNoPosition(t *testing.T) {
 	}
 }
 
-type fakeImages struct{ asked []string }
+// fakeImages records what the agent fetched and asked about. vms, when set,
+// lets Ensure see whether a throwaway VM already took the GPUs.
+type fakeImages struct {
+	vms       *fakeVMs
+	ensureErr error
+	ensured   []string
+	bootedBy  int // throwaway VMs started before the last Ensure
+	asked     []string
+}
+
+func (f *fakeImages) Ensure(ctx context.Context, v string) (string, string, error) {
+	f.ensured = append(f.ensured, v)
+	if f.vms != nil {
+		f.vms.mu.Lock()
+		f.bootedBy = len(f.vms.ephemeral)
+		f.vms.mu.Unlock()
+	}
+	if f.ensureErr != nil {
+		return "", "", f.ensureErr
+	}
+	return "/images/" + v + ".qcow2", v, nil
+}
 
 func (f *fakeImages) Checked(v string) *api.BenchmarkImage {
 	f.asked = append(f.asked, v)
@@ -504,7 +525,7 @@ func TestBenchmarkBootsThePayloadImageAndChecksItsGateways(t *testing.T) {
 	vms := newFakeVMs()
 	vms.ephOut = []byte(`{"ok":true,"gpus":[],"isolation":[{"name":"gateway_iad","ok":true,"detail":"203.0.113.7:443 answers SSH: works"}]}`)
 	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
-	imgs := &fakeImages{}
+	imgs := &fakeImages{vms: vms}
 	a.Images = imgs // a.Isolation stays nil: the gateways are checked anyway
 	cp.queue(42, api.KindBenchmark, map[string]any{
 		"image_version": "20261101-1",
@@ -515,6 +536,10 @@ func TestBenchmarkBootsThePayloadImageAndChecksItsGateways(t *testing.T) {
 		},
 	})
 	tickUntil(t, a, func() bool { return len(cp.resultsFor(42)) > 0 })
+	// The image is fetched before the VM takes the GPUs, and the VM boots it.
+	if len(imgs.ensured) != 1 || imgs.ensured[0] != "20261101-1" || imgs.bootedBy != 0 {
+		t.Fatalf("ensured %v with %d vms already booted", imgs.ensured, imgs.bootedBy)
+	}
 	if len(vms.ephImage) != 1 || vms.ephImage[0] != "20261101-1" {
 		t.Fatalf("benchmark vm image = %v, want 20261101-1", vms.ephImage)
 	}
@@ -533,5 +558,36 @@ func TestBenchmarkBootsThePayloadImageAndChecksItsGateways(t *testing.T) {
 	}
 	if b.Isolation == nil || len(b.Isolation.Checks) != 1 || b.Isolation.Checks[0].Name != "gateway_iad" || !b.Isolation.Checks[0].OK {
 		t.Fatalf("isolation = %+v", b.Isolation)
+	}
+}
+
+func TestBenchmarkWithoutTheImageBootsNothingAndBlamesNoGPU(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	imgs := &fakeImages{vms: vms, ensureErr: errors.New("sha256 mismatch")}
+	a.Images = imgs
+	cp.queue(43, api.KindBenchmark, map[string]any{"image_version": "20261101-1"})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(43)) > 0 })
+	if len(imgs.ensured) != 1 || len(vms.ephemeral) != 0 {
+		t.Fatalf("ensured %v, booted %v: no vm may boot without its image", imgs.ensured, vms.ephemeral)
+	}
+	b := cp.benchmarks[0]
+	if b.Image != nil || len(imgs.asked) != 0 {
+		t.Fatalf("image reported without being booted: %+v", b.Image)
+	}
+	if len(b.GPUs) != 2 {
+		t.Fatalf("gpus = %+v", b.GPUs)
+	}
+	for i, g := range b.GPUs {
+		if g.Index != i || g.Error != "image: sha256 mismatch" || g.MemOK || g.MatmulOK || g.PCIeAddress == "" {
+			t.Fatalf("gpu = %+v", g)
+		}
+	}
+	if len(vms.cleared) != 0 || len(vms.held) != 0 {
+		t.Fatalf("an image failure held %v or cleared %v", vms.held, vms.cleared)
+	}
+	if r := cp.resultsFor(43)[0]; r.Status != "done" || r.Result.(map[string]any)["error"] != "image: sha256 mismatch" {
+		t.Fatalf("result = %+v", r)
 	}
 }

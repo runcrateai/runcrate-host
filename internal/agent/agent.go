@@ -47,8 +47,11 @@ type Isolation interface {
 	LANToVM(ctx context.Context, guestIP string) api.IsolationCheck
 }
 
-// Images describes a local base image and how it was checked (nil: none).
+// Images fetches base images and describes how one was checked (nil: none).
 type Images interface {
+	// Ensure makes version present on the host, downloading and checking it
+	// when missing.
+	Ensure(ctx context.Context, version string) (path, version2 string, err error)
 	Checked(version string) *api.BenchmarkImage
 }
 
@@ -505,6 +508,19 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	sort.Ints(free)
 	var gpuErr string
 	var passed, failed []int
+	if len(free) > 0 && p.ImageVersion != "" && a.Images != nil {
+		// Fetch the image before the VM takes the GPUs, so a multi-GB
+		// download doesn't hold them. Without it nothing boots: every GPU is
+		// reported with the image error, a host problem the server doesn't
+		// count against the GPUs, and none is held or cleared.
+		if _, _, err := a.Images.Ensure(ctx, p.ImageVersion); err != nil {
+			gpuErr = clip("image: "+err.Error(), 500)
+			for _, idx := range free {
+				req.GPUs = append(req.GPUs, api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr})
+			}
+			free = nil
+		}
+	}
 	if len(free) > 0 {
 		var targets vm.IsolationTargets
 		var during func(context.Context, string)
