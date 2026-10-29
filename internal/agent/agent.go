@@ -36,7 +36,7 @@ type VMs interface {
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
 	Hold(gpus []int)
-	RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error)
+	RunEphemeral(ctx context.Context, id, owner, image string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error)
 }
 
 // Isolation is the host side of the benchmark's isolation checks.
@@ -485,8 +485,9 @@ func isolationChecks(fromVM []api.IsolationCheck, lan *api.IsolationCheck) []api
 	return out
 }
 
-// benchmark runs the GPU checks in a throwaway VM while the host measures
-// disk, internet and same-site peers, then reports it all.
+// benchmark runs the GPU checks in a throwaway VM, booted from the payload's
+// image, while the host measures disk, internet and same-site peers, then
+// reports it all.
 func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (any, error) {
 	topo := a.Host.Topology()
 	req := api.BenchmarkRequest{RequestID: api.RequestID("benchmark:" + strconv.FormatInt(cmdID, 10))}
@@ -515,7 +516,10 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 				lan = &c
 			}
 		}
-		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", free, vm.BenchScript(targets), 30*time.Minute, during)
+		// The tunnel gateways are checked even without the host-side checks:
+		// customers reach their VMs through them.
+		targets.TunnelGateways = vm.TunnelGatewaysFrom(p.Gateways)
+		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", p.ImageVersion, free, vm.BenchScript(targets), 30*time.Minute, during)
 		if a.Images != nil && image != "" {
 			req.Image = a.Images.Checked(image)
 		}

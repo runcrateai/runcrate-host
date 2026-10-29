@@ -610,9 +610,10 @@ func (m *Manager) prepare(ctx context.Context, r *Record) error {
 		return err
 	}
 	ensure := m.Images.Ensure
-	if r.Ephemeral {
-		// Throwaway VMs use whatever image is already here; only a host with
-		// none asks the API.
+	if r.Ephemeral && r.ImageVersion == "" {
+		// A throwaway VM given no version uses whatever image is already
+		// here; only a host with none asks the API. Given one (the
+		// benchmark's), it boots exactly that, downloading it if missing.
 		ensure = m.Images.Local
 	}
 	base, version, err := ensure(ctx, r.ImageVersion)
@@ -1044,7 +1045,7 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		id := fmt.Sprintf("scrub-%s-%d", hex.EncodeToString(hash(after))[:10], time.Now().UnixNano()%1e9)
 		rctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		var out []byte
-		out, _, err = m.RunEphemeral(rctx, id, owner, gpus, ScrubScript, 15*time.Minute, nil)
+		out, _, err = m.RunEphemeral(rctx, id, owner, "", gpus, ScrubScript, 15*time.Minute, nil)
 		cancel()
 		if ctx.Err() != nil {
 			return // shutting down: marker kept
@@ -1133,10 +1134,11 @@ func (m *Manager) ClearHold(gpus []int) {
 }
 
 // RunEphemeral boots a throwaway VM on gpus that runs script, waits for it
-// to post its JSON result to the metadata server, and destroys it. during,
+// to post its JSON result to the metadata server, and destroys it. image is
+// the base image version to boot ("" = whatever is already here). during,
 // when set, runs alongside with the VM's address (the host side of a check).
 // It returns the result and the base image version the VM booted.
-func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error) {
+func (m *Manager) RunEphemeral(ctx context.Context, id, owner, image string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error) {
 	if !ValidID(id) {
 		return nil, "", fmt.Errorf("bad id %q", id)
 	}
@@ -1157,12 +1159,12 @@ func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int
 	if m.HostRAMGB > 0 && m.HostRAMGB-reserveRAMGB < ram {
 		ram = max(4, m.HostRAMGB-reserveRAMGB)
 	}
-	if _, err := m.Create(ctx, Spec{ID: id, GPUIndexes: gpus, VCPUs: vcpus, RAMGB: ram, CloudInit: script, Ephemeral: true, Owner: owner}); err != nil {
+	if _, err := m.Create(ctx, Spec{ID: id, GPUIndexes: gpus, VCPUs: vcpus, RAMGB: ram, ImageVersion: image, CloudInit: script, Ephemeral: true, Owner: owner}); err != nil {
 		return nil, "", err
 	}
 	defer func() { _ = m.Destroy(context.WithoutCancel(ctx), id) }()
 	m.mu.Lock()
-	ip, image := m.vms[id].GuestIP, m.vms[id].ImageVersion
+	ip, booted := m.vms[id].GuestIP, m.vms[id].ImageVersion
 	m.mu.Unlock()
 	done := make(chan struct{})
 	if during != nil {
@@ -1173,9 +1175,9 @@ func (m *Manager) RunEphemeral(ctx context.Context, id, owner string, gpus []int
 	out, err := m.Meta.Result(ctx, ip)
 	<-done
 	if err != nil {
-		return nil, image, fmt.Errorf("throwaway vm gave no result: %w", err)
+		return nil, booted, fmt.Errorf("throwaway vm gave no result: %w", err)
 	}
-	return out, image, nil
+	return out, booted, nil
 }
 
 // Wait waits for background wipes and scrubs (shutdown, tests).

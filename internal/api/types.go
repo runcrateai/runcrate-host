@@ -282,7 +282,19 @@ type Peer struct {
 	PrivateAddrs []string `json:"private_addrs"`
 }
 
-// Benchmark is the benchmark payload.
+// Benchmark is the benchmark payload. ImageVersion is the VM image the
+// benchmark VM must boot ("" = whatever is on the host); Gateways are the
+// Runcrate tunnel gateways it must reach.
 type Benchmark struct {
-	Peers []Peer `json:"peers"`
+	Peers        []Peer    `json:"peers"`
+	ImageVersion string    `json:"image_version,omitempty"`
+	Gateways     []Gateway `json:"gateways,omitempty"`
+}
+
+// Gateway is a Runcrate tunnel gateway customers are reached through: an id
+// matching ^[a-z0-9-]{1,32}$, its IPv4 address and the port its SSH answers on.
+type Gateway struct {
+	ID   string `json:"id"`
+	IPv4 string `json:"ipv4"`
+	Port int    `json:"port"`
 }

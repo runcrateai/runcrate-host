@@ -111,6 +111,8 @@ type fakeVMs struct {
 	createErr  error
 	createWait chan struct{}
 	ephemeral  []string
+	ephImage   []string // image version asked of each throwaway VM
+	ephScript  []string
 	ephOut     []byte
 	ephErr     error
 	cleared    []int
@@ -185,15 +187,20 @@ func (v *fakeVMs) Hold(g []int) {
 	}
 }
 
-func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(context.Context, string)) ([]byte, string, error) {
+func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner, image string, gpus []int, script string, timeout time.Duration, during func(context.Context, string)) ([]byte, string, error) {
 	v.mu.Lock()
 	v.ephemeral = append(v.ephemeral, id)
+	v.ephImage = append(v.ephImage, image)
+	v.ephScript = append(v.ephScript, script)
 	out, err := v.ephOut, v.ephErr
 	v.mu.Unlock()
 	if during != nil {
 		during(ctx, "10.254.0.2")
 	}
-	return out, "20261026-1", err
+	if image == "" {
+		image = "20261026-1"
+	}
+	return out, image, err
 }
 
 type fakeHost struct{}
@@ -482,5 +489,49 @@ func TestBenchmarkWithAMissingGPUTrustsNoPosition(t *testing.T) {
 	}
 	if len(vms.cleared) != 0 || !vms.held[0] || !vms.held[1] {
 		t.Fatalf("cleared %v held %v", vms.cleared, vms.held)
+	}
+}
+
+type fakeImages struct{ asked []string }
+
+func (f *fakeImages) Checked(v string) *api.BenchmarkImage {
+	f.asked = append(f.asked, v)
+	return &api.BenchmarkImage{Version: v, SHA256OK: true, SignatureOK: true}
+}
+
+func TestBenchmarkBootsThePayloadImageAndChecksItsGateways(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.ephOut = []byte(`{"ok":true,"gpus":[],"isolation":[{"name":"gateway_iad","ok":true,"detail":"203.0.113.7:443 answers SSH: works"}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	imgs := &fakeImages{}
+	a.Images = imgs // a.Isolation stays nil: the gateways are checked anyway
+	cp.queue(42, api.KindBenchmark, map[string]any{
+		"image_version": "20261101-1",
+		"gateways": []map[string]any{
+			{"id": "iad", "ipv4": "203.0.113.7", "port": 443},
+			{"id": "bad id; reboot", "ipv4": "203.0.113.8", "port": 443},
+			{"id": "fra", "ipv4": "203.0.113.9 && reboot", "port": 443},
+		},
+	})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(42)) > 0 })
+	if len(vms.ephImage) != 1 || vms.ephImage[0] != "20261101-1" {
+		t.Fatalf("benchmark vm image = %v, want 20261101-1", vms.ephImage)
+	}
+	script := vms.ephScript[0]
+	if !strings.Contains(script, "must gateway_iad \"203.0.113.7:443 answers SSH\" ssh_banner 203.0.113.7 443\n") {
+		t.Fatalf("script lacks the iad gateway check:\n%s", script)
+	}
+	for _, bad := range []string{"reboot", "203.0.113.8", "203.0.113.9", "gateway_fra"} {
+		if strings.Contains(script, bad) {
+			t.Fatalf("script carries %q from an invalid gateway", bad)
+		}
+	}
+	b := cp.benchmarks[0]
+	if b.Image == nil || b.Image.Version != "20261101-1" || len(imgs.asked) != 1 {
+		t.Fatalf("image = %+v, asked %v", b.Image, imgs.asked)
+	}
+	if b.Isolation == nil || len(b.Isolation.Checks) != 1 || b.Isolation.Checks[0].Name != "gateway_iad" || !b.Isolation.Checks[0].OK {
+		t.Fatalf("isolation = %+v", b.Isolation)
 	}
 }
