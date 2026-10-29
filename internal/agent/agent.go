@@ -36,7 +36,7 @@ type VMs interface {
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
 	Hold(gpus []int)
-	RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error)
+	RunEphemeral(ctx context.Context, id, owner, image string, gpus []int, script string, timeout time.Duration, during func(ctx context.Context, guestIP string)) ([]byte, string, error)
 }
 
 // Isolation is the host side of the benchmark's isolation checks.
@@ -47,8 +47,11 @@ type Isolation interface {
 	LANToVM(ctx context.Context, guestIP string) api.IsolationCheck
 }
 
-// Images describes a local base image and how it was checked (nil: none).
+// Images fetches base images and describes how one was checked (nil: none).
 type Images interface {
+	// Ensure makes version present on the host, downloading and checking it
+	// when missing.
+	Ensure(ctx context.Context, version string) (path, version2 string, err error)
 	Checked(version string) *api.BenchmarkImage
 }
 
@@ -485,8 +488,9 @@ func isolationChecks(fromVM []api.IsolationCheck, lan *api.IsolationCheck) []api
 	return out
 }
 
-// benchmark runs the GPU checks in a throwaway VM while the host measures
-// disk, internet and same-site peers, then reports it all.
+// benchmark runs the GPU checks in a throwaway VM, booted from the payload's
+// image, while the host measures disk, internet and same-site peers, then
+// reports it all.
 func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (any, error) {
 	topo := a.Host.Topology()
 	req := api.BenchmarkRequest{RequestID: api.RequestID("benchmark:" + strconv.FormatInt(cmdID, 10))}
@@ -504,6 +508,24 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	sort.Ints(free)
 	var gpuErr string
 	var passed, failed []int
+	if len(free) > 0 && p.ImageVersion != "" && a.Images != nil {
+		// Fetch the image before the VM takes the GPUs, so a multi-GB
+		// download doesn't hold them. Without it nothing boots: every GPU is
+		// reported with the image error, a host problem the server doesn't
+		// count against the GPUs, and none is held or cleared.
+		if _, _, err := a.Images.Ensure(ctx, p.ImageVersion); err != nil {
+			gpuErr = clip("image: "+err.Error(), 500)
+			for _, idx := range free {
+				req.GPUs = append(req.GPUs, api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr})
+			}
+			free = nil
+		} else {
+			// The download can take minutes: GPUs a create took meanwhile
+			// are left out (and not reported); none left, no VM.
+			free = a.VMs.FreeGPUs(true)
+			sort.Ints(free)
+		}
+	}
 	if len(free) > 0 {
 		var targets vm.IsolationTargets
 		var during func(context.Context, string)
@@ -515,7 +537,10 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 				lan = &c
 			}
 		}
-		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", free, vm.BenchScript(targets), 30*time.Minute, during)
+		// The tunnel gateways are checked even without the host-side checks:
+		// customers reach their VMs through them.
+		targets.TunnelGateways = vm.TunnelGatewaysFrom(p.Gateways)
+		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", p.ImageVersion, free, vm.BenchScript(targets), 30*time.Minute, during)
 		if a.Images != nil && image != "" {
 			req.Image = a.Images.Checked(image)
 		}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,14 +19,62 @@ import (
 // The benchmark's isolation checks prove the firewall on this host, not in
 // theory: the benchmark VM tries to reach what a customer VM must never reach
 // (the host, its LAN, private ranges) and what it must (the internet, DNS,
-// the metadata server), and the host tries to open a connection to the VM
-// the way a machine on its LAN would.
+// the metadata server, the Runcrate tunnel gateways), and the host tries to
+// open a connection to the VM the way a machine on its LAN would.
 
-// IsolationTargets are this host's addresses the benchmark VM must not reach.
+// IsolationTargets are this host's addresses the benchmark VM must not reach,
+// and the tunnel gateways it must.
 type IsolationTargets struct {
 	HostIPs      []string // the host's own IPv4 addresses
 	Gateways     []string // its default gateways (the partner's LAN)
 	DockerBridge string   // docker0's address, when Docker is installed
+	// TunnelGateways are the Runcrate tunnel gateways from the benchmark
+	// payload (see TunnelGatewaysFrom).
+	TunnelGateways []TunnelGateway
+}
+
+// TunnelGateway is a Runcrate tunnel gateway the benchmark VM must reach
+// with an SSH banner coming back.
+type TunnelGateway struct {
+	ID   string // ^[a-z0-9-]{1,32}$
+	IP   string // IPv4, formatted from the parsed address
+	Port int    // 1..65535
+}
+
+// maxTunnelGateways bounds the gateway checks, so they stay well inside the
+// 32 isolation checks the control plane stores.
+const maxTunnelGateways = 8
+
+var tunnelGatewayIDRe = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// tunnelGateway checks one gateway and rebuilds it from parsed values only.
+func tunnelGateway(id, ip string, port int) (TunnelGateway, bool) {
+	p := net.ParseIP(ip).To4()
+	if !tunnelGatewayIDRe.MatchString(id) || p == nil || port < 1 || port > 65535 {
+		return TunnelGateway{}, false
+	}
+	return TunnelGateway{ID: id, IP: p.String(), Port: port}, true
+}
+
+// TunnelGatewaysFrom keeps the payload's well-formed gateways: a valid id
+// (the first of a repeated one wins), an IPv4 address and a port, at most
+// maxTunnelGateways of them. Anything else is dropped, so no payload text
+// reaches the benchmark script.
+func TunnelGatewaysFrom(in []api.Gateway) []TunnelGateway {
+	var out []TunnelGateway
+	seen := map[string]bool{}
+	for _, g := range in {
+		if len(out) == maxTunnelGateways {
+			break
+		}
+		tg, ok := tunnelGateway(g.ID, g.IPv4, g.Port)
+		if !ok || seen[tg.ID] {
+			continue
+		}
+		seen[tg.ID] = true
+		out = append(out, tg)
+	}
+	return out
 }
 
 // IsolationTargets reads the host's addresses, gateways and Docker bridge.
@@ -76,13 +125,16 @@ func dedupe(in []string, max int) []string {
 
 // isolationScript is the benchmark VM's part: one "name<TAB>ok<TAB>detail"
 // line per check in $out/iso.txt. Every address in it comes from net.IP
-// formatting, never from free text.
+// formatting, never from free text, and every gateway id matches
+// ^[a-z0-9-]{1,32}$.
 func isolationScript(t IsolationTargets) string {
 	var b strings.Builder
 	b.WriteString(`iso="$out/iso.txt"; : > "$iso"
 # The firewall drops (never rejects), so only a timeout (124) means it
 # held: 0 connected, and a refusal or unreachable means the packet got past it.
 tcp() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+# ssh_banner IP PORT: passes when IP:PORT answers with an SSH banner.
+ssh_banner() { timeout 8 bash -c "exec 3<>/dev/tcp/$1/$2; head -c 4 <&3" 2>/dev/null | grep -q '^SSH-'; }
 # must NAME DETAIL CMD...: passes when CMD succeeds.
 must() { n=$1; d=$2; shift 2; if "$@" >/dev/null 2>&1; then r=true; s=works; else r=false; s=failed; fi; printf '%s\t%s\t%s: %s\n' "$n" "$r" "$d" "$s" >> "$iso"; }
 # closed NAME DETAIL HOST:PORT...: passes when every one of them times out.
@@ -92,6 +144,17 @@ must egress "https://www.runcrate.ai" curl -sS -m 8 -o /dev/null https://www.run
 must dns "resolve www.runcrate.ai" getent hosts www.runcrate.ai
 must metadata "169.254.169.254" curl -sS -m 4 -o /dev/null http://169.254.169.254/runcrate/v1/reclaim-notice
 `)
+	// The tunnel gateways customers are reached through, rechecked here so
+	// nothing unchecked can reach the script whoever built t.
+	n := 0
+	for _, g := range t.TunnelGateways {
+		tg, ok := tunnelGateway(g.ID, g.IP, g.Port)
+		if !ok || n == maxTunnelGateways {
+			continue
+		}
+		n++
+		fmt.Fprintf(&b, "must gateway_%s \"%s:%d answers SSH\" ssh_banner %s %d\n", tg.ID, tg.IP, tg.Port, tg.IP, tg.Port)
+	}
 	fmt.Fprintf(&b, "closed host_tap_gateway \"host side of the VM link $gw\" \"$gw:22\" \"$gw:%d\"\n", MetadataPort)
 	closed := func(name, detail string, ips []string, ports ...int) {
 		var hp []string

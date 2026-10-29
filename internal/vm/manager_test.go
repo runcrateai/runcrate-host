@@ -305,6 +305,51 @@ func TestFailedScrubHoldsTheGPU(t *testing.T) {
 	}
 }
 
+// recImages records which of Ensure and Local each VM asked, and for what.
+type recImages struct {
+	path  string
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *recImages) Ensure(ctx context.Context, v string) (string, string, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, "ensure "+v)
+	r.mu.Unlock()
+	return fakeImages{r.path}.Ensure(ctx, v)
+}
+
+func (r *recImages) Local(ctx context.Context, v string) (string, string, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, "local "+v)
+	r.mu.Unlock()
+	return fakeImages{r.path}.Local(ctx, v)
+}
+
+func TestThrowawayVMBootsTheGivenImage(t *testing.T) {
+	f := newFixture(t)
+	imgs := &recImages{path: filepath.Join(f.root, "data/images/v1.qcow2")}
+	f.m.Images = imgs
+	f.answerEphemeral(`{"ok":true,"gpus":[]}`)
+	for _, id := range []string{"bench-1", "bench-2"} {
+		f.prepTap(t, id)
+	}
+	ctx := context.Background()
+	// With a version (the benchmark's), Ensure: it downloads a missing one.
+	if _, v, err := f.m.RunEphemeral(ctx, "bench-1", "", "20261101-1", []int{0}, "#!/bin/bash\n", time.Minute, nil); err != nil || v != "20261101-1" {
+		t.Fatalf("RunEphemeral(20261101-1) = %q, %v", v, err)
+	}
+	// Without one, Local: whatever image is already here.
+	if _, v, err := f.m.RunEphemeral(ctx, "bench-2", "", "", []int{0}, "#!/bin/bash\n", time.Minute, nil); err != nil || v != "v1" {
+		t.Fatalf("RunEphemeral(\"\") = %q, %v", v, err)
+	}
+	imgs.mu.Lock()
+	defer imgs.mu.Unlock()
+	if len(imgs.calls) != 2 || imgs.calls[0] != "ensure 20261101-1" || imgs.calls[1] != "local " {
+		t.Fatalf("image calls = %q", imgs.calls)
+	}
+}
+
 func TestNVSwitchNodeIsRentedWhole(t *testing.T) {
 	f := newFixture(t)
 	f.m.NVSwitches = []string{"0000:a0:00.0"}

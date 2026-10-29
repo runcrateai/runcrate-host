@@ -111,8 +111,12 @@ type fakeVMs struct {
 	createErr  error
 	createWait chan struct{}
 	ephemeral  []string
+	ephImage   []string // image version asked of each throwaway VM
+	ephScript  []string
+	ephGPUs    [][]int
 	ephOut     []byte
 	ephErr     error
+	free       []int // FreeGPUs' answer when set
 	cleared    []int
 	held       map[int]bool
 }
@@ -163,7 +167,15 @@ func (v *fakeVMs) List(ctx context.Context) []api.VMStatus {
 	return out
 }
 
-func (v *fakeVMs) FreeGPUs(bool) []int { return []int{0, 1} }
+// FreeGPUs is 0 and 1 unless free is set.
+func (v *fakeVMs) FreeGPUs(bool) []int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.free != nil {
+		return append([]int{}, v.free...)
+	}
+	return []int{0, 1}
+}
 
 func (v *fakeVMs) HeldGPUs() map[int]bool {
 	v.mu.Lock()
@@ -185,15 +197,21 @@ func (v *fakeVMs) Hold(g []int) {
 	}
 }
 
-func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner string, gpus []int, script string, timeout time.Duration, during func(context.Context, string)) ([]byte, string, error) {
+func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner, image string, gpus []int, script string, timeout time.Duration, during func(context.Context, string)) ([]byte, string, error) {
 	v.mu.Lock()
 	v.ephemeral = append(v.ephemeral, id)
+	v.ephImage = append(v.ephImage, image)
+	v.ephScript = append(v.ephScript, script)
+	v.ephGPUs = append(v.ephGPUs, append([]int{}, gpus...))
 	out, err := v.ephOut, v.ephErr
 	v.mu.Unlock()
 	if during != nil {
 		during(ctx, "10.254.0.2")
 	}
-	return out, "20261026-1", err
+	if image == "" {
+		image = "20261026-1"
+	}
+	return out, image, err
 }
 
 type fakeHost struct{}
@@ -482,5 +500,148 @@ func TestBenchmarkWithAMissingGPUTrustsNoPosition(t *testing.T) {
 	}
 	if len(vms.cleared) != 0 || !vms.held[0] || !vms.held[1] {
 		t.Fatalf("cleared %v held %v", vms.cleared, vms.held)
+	}
+}
+
+// fakeImages records what the agent fetched and asked about. vms, when set,
+// lets Ensure see whether a throwaway VM already took the GPUs; takeFree,
+// when set, is what FreeGPUs answers once Ensure ran (a create took the rest
+// during the download).
+type fakeImages struct {
+	vms       *fakeVMs
+	ensureErr error
+	takeFree  []int
+	ensured   []string
+	bootedBy  int // throwaway VMs started before the last Ensure
+	asked     []string
+}
+
+func (f *fakeImages) Ensure(ctx context.Context, v string) (string, string, error) {
+	f.ensured = append(f.ensured, v)
+	if f.vms != nil {
+		f.vms.mu.Lock()
+		f.bootedBy = len(f.vms.ephemeral)
+		if f.takeFree != nil {
+			f.vms.free = f.takeFree
+		}
+		f.vms.mu.Unlock()
+	}
+	if f.ensureErr != nil {
+		return "", "", f.ensureErr
+	}
+	return "/images/" + v + ".qcow2", v, nil
+}
+
+func (f *fakeImages) Checked(v string) *api.BenchmarkImage {
+	f.asked = append(f.asked, v)
+	return &api.BenchmarkImage{Version: v, SHA256OK: true, SignatureOK: true}
+}
+
+func TestBenchmarkBootsThePayloadImageAndChecksItsGateways(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.ephOut = []byte(`{"ok":true,"gpus":[],"isolation":[{"name":"gateway_iad","ok":true,"detail":"203.0.113.7:443 answers SSH: works"}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	imgs := &fakeImages{vms: vms}
+	a.Images = imgs // a.Isolation stays nil: the gateways are checked anyway
+	cp.queue(42, api.KindBenchmark, map[string]any{
+		"image_version": "20261101-1",
+		"gateways": []map[string]any{
+			{"id": "iad", "ipv4": "203.0.113.7", "port": 443},
+			{"id": "bad id; reboot", "ipv4": "203.0.113.8", "port": 443},
+			{"id": "fra", "ipv4": "203.0.113.9 && reboot", "port": 443},
+		},
+	})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(42)) > 0 })
+	// The image is fetched before the VM takes the GPUs, and the VM boots it.
+	if len(imgs.ensured) != 1 || imgs.ensured[0] != "20261101-1" || imgs.bootedBy != 0 {
+		t.Fatalf("ensured %v with %d vms already booted", imgs.ensured, imgs.bootedBy)
+	}
+	if len(vms.ephImage) != 1 || vms.ephImage[0] != "20261101-1" {
+		t.Fatalf("benchmark vm image = %v, want 20261101-1", vms.ephImage)
+	}
+	script := vms.ephScript[0]
+	if !strings.Contains(script, "must gateway_iad \"203.0.113.7:443 answers SSH\" ssh_banner 203.0.113.7 443\n") {
+		t.Fatalf("script lacks the iad gateway check:\n%s", script)
+	}
+	for _, bad := range []string{"reboot", "203.0.113.8", "203.0.113.9", "gateway_fra"} {
+		if strings.Contains(script, bad) {
+			t.Fatalf("script carries %q from an invalid gateway", bad)
+		}
+	}
+	b := cp.benchmarks[0]
+	if b.Image == nil || b.Image.Version != "20261101-1" || len(imgs.asked) != 1 {
+		t.Fatalf("image = %+v, asked %v", b.Image, imgs.asked)
+	}
+	if b.Isolation == nil || len(b.Isolation.Checks) != 1 || b.Isolation.Checks[0].Name != "gateway_iad" || !b.Isolation.Checks[0].OK {
+		t.Fatalf("isolation = %+v", b.Isolation)
+	}
+}
+
+func TestBenchmarkWithoutTheImageBootsNothingAndBlamesNoGPU(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	imgs := &fakeImages{vms: vms, ensureErr: errors.New("sha256 mismatch")}
+	a.Images = imgs
+	cp.queue(43, api.KindBenchmark, map[string]any{"image_version": "20261101-1"})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(43)) > 0 })
+	if len(imgs.ensured) != 1 || len(vms.ephemeral) != 0 {
+		t.Fatalf("ensured %v, booted %v: no vm may boot without its image", imgs.ensured, vms.ephemeral)
+	}
+	b := cp.benchmarks[0]
+	if b.Image != nil || len(imgs.asked) != 0 {
+		t.Fatalf("image reported without being booted: %+v", b.Image)
+	}
+	if len(b.GPUs) != 2 {
+		t.Fatalf("gpus = %+v", b.GPUs)
+	}
+	for i, g := range b.GPUs {
+		if g.Index != i || g.Error != "image: sha256 mismatch" || g.MemOK || g.MatmulOK || g.PCIeAddress == "" {
+			t.Fatalf("gpu = %+v", g)
+		}
+	}
+	if len(vms.cleared) != 0 || len(vms.held) != 0 {
+		t.Fatalf("an image failure held %v or cleared %v", vms.held, vms.cleared)
+	}
+	if r := cp.resultsFor(43)[0]; r.Status != "done" || r.Result.(map[string]any)["error"] != "image: sha256 mismatch" {
+		t.Fatalf("result = %+v", r)
+	}
+}
+
+func TestBenchmarkLeavesOutGPUsTakenDuringTheDownload(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		left     []int
+		wantBoot bool
+	}{
+		{"one left", []int{0}, true},
+		{"none left", []int{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			vms := newFakeVMs()
+			vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+			a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+			a.Images = &fakeImages{vms: vms, takeFree: tc.left}
+			cp.queue(44, api.KindBenchmark, map[string]any{"image_version": "20261101-1"})
+			tickUntil(t, a, func() bool { return len(cp.resultsFor(44)) > 0 })
+			b := cp.benchmarks[0]
+			if !tc.wantBoot {
+				if len(vms.ephemeral) != 0 || len(b.GPUs) != 0 || len(vms.held) != 0 || len(vms.cleared) != 0 {
+					t.Fatalf("booted %v, reported %+v, held %v, cleared %v", vms.ephemeral, b.GPUs, vms.held, vms.cleared)
+				}
+				return
+			}
+			if len(vms.ephGPUs) != 1 || len(vms.ephGPUs[0]) != 1 || vms.ephGPUs[0][0] != 0 {
+				t.Fatalf("benchmarked gpus = %v, want [[0]]", vms.ephGPUs)
+			}
+			if len(b.GPUs) != 1 || b.GPUs[0].Index != 0 || !b.GPUs[0].MemOK {
+				t.Fatalf("reported gpus = %+v, want only gpu 0", b.GPUs)
+			}
+			if vms.held[1] || len(vms.cleared) != 1 || vms.cleared[0] != 0 {
+				t.Fatalf("held %v cleared %v: gpu 1 belongs to the create", vms.held, vms.cleared)
+			}
+		})
 	}
 }
