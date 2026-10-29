@@ -519,6 +519,11 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 				req.GPUs = append(req.GPUs, api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr})
 			}
 			free = nil
+		} else {
+			// The download can take minutes: GPUs a create took meanwhile
+			// are left out (and not reported); none left, no VM.
+			free = a.VMs.FreeGPUs(true)
+			sort.Ints(free)
 		}
 	}
 	if len(free) > 0 {

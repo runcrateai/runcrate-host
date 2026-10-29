@@ -113,8 +113,10 @@ type fakeVMs struct {
 	ephemeral  []string
 	ephImage   []string // image version asked of each throwaway VM
 	ephScript  []string
+	ephGPUs    [][]int
 	ephOut     []byte
 	ephErr     error
+	free       []int // FreeGPUs' answer when set
 	cleared    []int
 	held       map[int]bool
 }
@@ -165,7 +167,15 @@ func (v *fakeVMs) List(ctx context.Context) []api.VMStatus {
 	return out
 }
 
-func (v *fakeVMs) FreeGPUs(bool) []int { return []int{0, 1} }
+// FreeGPUs is 0 and 1 unless free is set.
+func (v *fakeVMs) FreeGPUs(bool) []int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.free != nil {
+		return append([]int{}, v.free...)
+	}
+	return []int{0, 1}
+}
 
 func (v *fakeVMs) HeldGPUs() map[int]bool {
 	v.mu.Lock()
@@ -192,6 +202,7 @@ func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner, image string, gpu
 	v.ephemeral = append(v.ephemeral, id)
 	v.ephImage = append(v.ephImage, image)
 	v.ephScript = append(v.ephScript, script)
+	v.ephGPUs = append(v.ephGPUs, append([]int{}, gpus...))
 	out, err := v.ephOut, v.ephErr
 	v.mu.Unlock()
 	if during != nil {
@@ -493,10 +504,13 @@ func TestBenchmarkWithAMissingGPUTrustsNoPosition(t *testing.T) {
 }
 
 // fakeImages records what the agent fetched and asked about. vms, when set,
-// lets Ensure see whether a throwaway VM already took the GPUs.
+// lets Ensure see whether a throwaway VM already took the GPUs; takeFree,
+// when set, is what FreeGPUs answers once Ensure ran (a create took the rest
+// during the download).
 type fakeImages struct {
 	vms       *fakeVMs
 	ensureErr error
+	takeFree  []int
 	ensured   []string
 	bootedBy  int // throwaway VMs started before the last Ensure
 	asked     []string
@@ -507,6 +521,9 @@ func (f *fakeImages) Ensure(ctx context.Context, v string) (string, string, erro
 	if f.vms != nil {
 		f.vms.mu.Lock()
 		f.bootedBy = len(f.vms.ephemeral)
+		if f.takeFree != nil {
+			f.vms.free = f.takeFree
+		}
 		f.vms.mu.Unlock()
 	}
 	if f.ensureErr != nil {
@@ -589,5 +606,42 @@ func TestBenchmarkWithoutTheImageBootsNothingAndBlamesNoGPU(t *testing.T) {
 	}
 	if r := cp.resultsFor(43)[0]; r.Status != "done" || r.Result.(map[string]any)["error"] != "image: sha256 mismatch" {
 		t.Fatalf("result = %+v", r)
+	}
+}
+
+func TestBenchmarkLeavesOutGPUsTakenDuringTheDownload(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		left     []int
+		wantBoot bool
+	}{
+		{"one left", []int{0}, true},
+		{"none left", []int{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			vms := newFakeVMs()
+			vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+			a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+			a.Images = &fakeImages{vms: vms, takeFree: tc.left}
+			cp.queue(44, api.KindBenchmark, map[string]any{"image_version": "20261101-1"})
+			tickUntil(t, a, func() bool { return len(cp.resultsFor(44)) > 0 })
+			b := cp.benchmarks[0]
+			if !tc.wantBoot {
+				if len(vms.ephemeral) != 0 || len(b.GPUs) != 0 || len(vms.held) != 0 || len(vms.cleared) != 0 {
+					t.Fatalf("booted %v, reported %+v, held %v, cleared %v", vms.ephemeral, b.GPUs, vms.held, vms.cleared)
+				}
+				return
+			}
+			if len(vms.ephGPUs) != 1 || len(vms.ephGPUs[0]) != 1 || vms.ephGPUs[0][0] != 0 {
+				t.Fatalf("benchmarked gpus = %v, want [[0]]", vms.ephGPUs)
+			}
+			if len(b.GPUs) != 1 || b.GPUs[0].Index != 0 || !b.GPUs[0].MemOK {
+				t.Fatalf("reported gpus = %+v, want only gpu 0", b.GPUs)
+			}
+			if vms.held[1] || len(vms.cleared) != 1 || vms.cleared[0] != 0 {
+				t.Fatalf("held %v cleared %v: gpu 1 belongs to the create", vms.held, vms.cleared)
+			}
+		})
 	}
 }
