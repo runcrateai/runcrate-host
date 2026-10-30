@@ -19,7 +19,7 @@ The installer refuses a token file that is not owned by root or that anyone else
 
 - Bare metal, x86_64. Not a VM: GPUs are passed through to customer VMs, which needs the real hardware.
 - Ubuntu 22.04, Ubuntu 24.04 or Debian 12.
-- NVIDIA GPUs: datacenter cards (A100, H100, H200, B200, L40S, RTX 6000 and others) or GeForce RTX 30, 40 and 50 series.
+- NVIDIA GPUs: datacenter cards (A100, H100, H200, B200, L40S, RTX 6000 and others) or the GeForce RTX 3090, 4090 and 5090. Other GeForce cards aren't sold on Runcrate.
 - Virtualization (VT-x / AMD-V) and IOMMU (VT-d / AMD-Vi) turned on in the BIOS. If the kernel has the IOMMU off, the installer shows the exact GRUB line, adds it and reboots when you say yes (or with `--yes`). Then run the same command again.
 - Outbound HTTPS. No inbound ports, NAT is fine. The one exception: while a benchmark runs on two or more hosts of the same site, iperf3 (and ib_write_bw with InfiniBand) listens on the hosts' private addresses for up to 5 minutes, open only to the site's other hosts.
 - Fast local disk for VM disks, 100 GB or more free (`--data-dir` to choose where). The data directory must be new or empty: the agent marks it as its own (`.runcrate-host-data`) and never shares it with your files.
