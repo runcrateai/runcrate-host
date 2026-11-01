@@ -51,8 +51,8 @@ const (
 )
 
 // ReserveRAMGB is the RAM a host of totalGB keeps for itself: at least 8 GB,
-// and 12% (rounded up) of a larger host's, the control plane's rule
-// (runcrate_app partner-hosts/inventory.ts). A passthrough VM pins all of its
+// and 12% (rounded up) of a larger host's, the rule of the control plane's VM
+// sizing. A passthrough VM pins all of its
 // memory, so the host's share must cover the kernel, QEMU and the IOMMU's
 // page tables: a 180 GB VM on a 188 GB H100 host (8 kept) was killed out of
 // memory as it started; a 168 GB one ran (2026-11-01 e2e). install.sh's

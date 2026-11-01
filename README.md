@@ -143,6 +143,22 @@ What Runcrate does about that instead:
 - Customers are shown options by GPU model, region and tier, never by host company. The dashboard shows hosts a pseudonym for each customer, never the customer's identity; a host with root can still learn it from the VM's contents. A VM's internet traffic leaves through the host's own connection, so its public IP is the host's.
 - A storage volume's keys travel in the VM's first-boot script, which a host's operator can read. So a launch with a volume goes only to a Datacenter host (a site Runcrate has verified), never to a Community one.
 
+## Measured on real hardware
+
+One machine, one run: a bare-metal server with one H100 80GB PCIe, Ubuntu 24.04 and 188 GB of RAM, on 1 Nov 2026, with agent 0.1.4 from the production release and no manual changes. These figures describe that machine only, not other GPUs or servers.
+
+- **`--check`** (no account): `READY`, exit 0, both as a user and with `sudo`.
+- **From the end of the install to verified and online:** 1 min 52 s (the install itself took 21 s).
+- **Benchmark VM:** FP16 matrix multiply 641.9 TFLOPS, memory test over 78.7 GB passed, disk read 46.0 GB/s and write 30.7 GB/s, 11 of 11 isolation checks passed.
+- **A customer VM launched through the public API:** 30 vCPU and 165 GB of RAM (the host kept 23 GB). Inside the guest, `nvidia-smi` shows the H100 PCIe with 81559 MiB, driver 580.196.07 and ECC on. `rc-gpubench` measures 655.1 TFLOPS FP16; a PyTorch FP16 matrix multiply runs at 429 TFLOPS, a GPU memory copy at 1851 GB/s and host to GPU copies at 57.5 GB/s.
+- **After the VM was terminated:** the GPU memory scrub passed and the GPU returned healthy.
+- **Uninstall:** the GPU came off `vfio-pci` and its `reset_method` was back to the kernel default. With an NVIDIA driver installed afterwards for this check, the host's `nvidia-smi` saw the card with 81559 MiB.
+
+An earlier run on the same server that morning, with agent 0.1.3, found two problems. Both are fixed in 0.1.4, and the run above hit neither:
+
+- On this H100 PCIe, the FLR `vfio-pci` does when the device is opened left the card unusable: its BARs came back cleared, the guest driver read `0xbadf0200` from the card and called it unsupported, and with the BARs written back by hand the first CUDA job hit Xid 95 and hung. The agent now uses a bus reset for the H100 PCIe (`10de:2331`) only (an allowlist, with FLR kept as the fallback).
+- A VM sized to nearly all of the host's RAM was killed by the host's OOM killer. The host now keeps max(8 GB, 12%) of its RAM for itself.
+
 ## What the benchmark verifies
 
 On Runcrate's command (a new host runs one before it is listed), the agent boots a throwaway VM from the current signed VM image, its sha256 and signature checked, and reports:
