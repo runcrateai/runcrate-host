@@ -114,7 +114,7 @@ This stops every VM, overwrites and deletes their disks, removes the VM network 
 go test ./...
 make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
-RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -a runcrate-host -w) \
+RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
   go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
 ```
 
@@ -123,11 +123,11 @@ The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cuda
 ### Publishing a release
 
 ```sh
-hack/publish.sh 0.1.1                # from a clean checkout of a commit on origin/main, on the owner's Mac
+hack/publish.sh 0.1.1                # from a clean checkout of a commit on origin/main; needs the release key (see the script)
 hack/check-install.sh                # any time: what partners download is signed and consistent
 ```
 
-The repo is private, so GitHub release downloads don't work for partners. `get.runcrate.ai` is the Worker in `hack/get-worker` (`cd hack/get-worker && wrangler deploy`): it serves only these release files, read-only, from the R2 bucket `runcrate-host-images`. `publish.sh` builds the agent, signs it (`runcrate-host`) and `install.sh` (`runcrate-install`) with the release key, and uploads:
+Releases are served from `get.runcrate.ai`, the Worker in `hack/get-worker` (`cd hack/get-worker && wrangler deploy`): it serves only these release files, read-only, from the R2 bucket `runcrate-host-images`. `publish.sh` builds the agent, signs it (`runcrate-host`) and `install.sh` (`runcrate-install`) with the release key, and uploads:
 
 | URL | What |
 | --- | --- |

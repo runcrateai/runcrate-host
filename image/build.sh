@@ -7,7 +7,7 @@
 #
 # Writes out/runcrate-vm-<version>.qcow2 and its .sha256. The agent only takes
 # a signed image: sign it (kind runcrate-vm) and upload the .sig next to it:
-#   RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -w) \
+#   RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
 #     go run ./hack/sign -kind runcrate-vm -version <version> out/runcrate-vm-<version>.qcow2
 #   DRIVER_BRANCH=580   the driver branch (default 580). Never "newest": image 20261026-1
 #                       took nvidia-open 615.71.10, which refuses the H100 PCIe (10de:2331)
