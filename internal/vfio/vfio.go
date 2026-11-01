@@ -6,8 +6,10 @@ package vfio
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,7 +35,8 @@ func (s Sysfs) driver(addr string) string {
 }
 
 func write(path, val string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	// O_TRUNC as a shell's > does: sysfs ignores it, a test's plain file gets only val.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
 		return err
 	}
@@ -42,13 +45,14 @@ func write(path, val string) error {
 	return err
 }
 
-// Bind puts one function on vfio-pci. Idempotent.
+// Bind puts one function on vfio-pci, reset by a bus reset where the kernel
+// offers one (preferBusReset). Idempotent.
 func (s Sysfs) Bind(addr string) error {
 	if !hw.ValidPCIAddress(addr) {
 		return fmt.Errorf("bad pci address %q", addr)
 	}
 	if s.driver(addr) == Driver {
-		return nil
+		return s.preferBusReset(addr)
 	}
 	if err := write(s.dev(addr, "driver_override"), Driver); err != nil {
 		return fmt.Errorf("%s: driver_override: %w", addr, err)
@@ -68,18 +72,61 @@ func (s Sysfs) Bind(addr string) error {
 	}
 	for i := 0; i < 50; i++ {
 		if s.driver(addr) == Driver {
-			return nil
+			return s.preferBusReset(addr)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("%s: still on %q after binding to vfio-pci", addr, s.driver(addr))
 }
 
-// Release gives one function back to the host: clears the override and lets
-// the kernel pick the normal driver (nvidia or nouveau, if installed).
+// preferBusReset makes the kernel reset the function with a secondary bus
+// reset instead of FLR. The kernel lists "bus" in reset_method only when the
+// function is alone on its bus, so a card with an audio function keeps its
+// methods. Why: an H100 PCIe (10de:2331, Latitude g3-h100-small, host kernel
+// 7.0) reset by FLR when vfio-pci opened it came back with its BARs cleared
+// and memory decode off. The guest driver read 0xbadf0200 from BOOT_0 and
+// called the card unsupported. Once the BARs were written back, the first
+// CUDA job hit Xid 95 (uncontained) and hung. With a bus reset, the same card
+// passed the benchmark and served a VM. Kernels without reset_method (before
+// 5.15) have nothing to set.
+func (s Sysfs) preferBusReset(addr string) error {
+	b, err := os.ReadFile(s.dev(addr, "reset_method"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%s: read reset_method: %w", addr, err)
+	}
+	methods := strings.Fields(string(b))
+	if len(methods) == 0 || methods[0] == "bus" || !slices.Contains(methods, "bus") {
+		return nil
+	}
+	if err := write(s.dev(addr, "reset_method"), "bus"); err != nil {
+		return fmt.Errorf("%s: set reset_method to bus: %w", addr, err)
+	}
+	return nil
+}
+
+// defaultReset gives the function back the kernel's own reset methods.
+func (s Sysfs) defaultReset(addr string) error {
+	if _, err := os.Stat(s.dev(addr, "reset_method")); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err := write(s.dev(addr, "reset_method"), "default"); err != nil {
+		return fmt.Errorf("%s: restore reset_method: %w", addr, err)
+	}
+	return nil
+}
+
+// Release gives one function back to the host: its default reset methods,
+// clears the override and lets the kernel pick the normal driver (nvidia or
+// nouveau, if installed).
 func (s Sysfs) Release(addr string) error {
 	if !hw.ValidPCIAddress(addr) {
 		return fmt.Errorf("bad pci address %q", addr)
+	}
+	if err := s.defaultReset(addr); err != nil {
+		return err
 	}
 	if err := write(s.dev(addr, "driver_override"), "\n"); err != nil {
 		return fmt.Errorf("%s: clear driver_override: %w", addr, err)
