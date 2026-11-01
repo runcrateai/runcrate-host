@@ -255,4 +255,4 @@ Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which ve
 
 ## License
 
-The source is published so that anyone running the Runcrate host agent on their machines can read exactly what it does; see [LICENSE](LICENSE). The official releases at `get.runcrate.ai` are signed with Runcrate's ed25519 release key: the installer checks the agent's signature before installing it, and the agent checks the signature of every update and VM image it takes. The Host Partner Terms that host companies accept forbid changing or getting around the host agent.
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The official releases at `get.runcrate.ai` are signed with Runcrate's ed25519 release key: the installer checks the agent's signature before installing it, and the agent checks the signature of every update and VM image it takes. The Host Partner Terms that host companies accept forbid changing or getting around the host agent.
