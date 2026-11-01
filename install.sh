@@ -41,8 +41,9 @@ KVM_DEV=/dev/kvm
 PCI_IDS="/usr/share/misc/pci.ids /usr/share/hwdata/pci.ids /usr/share/pci.ids"
 # Free space the VM data directory needs (GB), as the README says.
 MIN_DISK_GB=100
-# RAM the agent keeps for the host (internal/vm/manager.go reserveRAMGB).
-HOST_RAM_GB=8
+# RAM the agent keeps for the host: at least this, and 12% (rounded up) of a
+# larger host's (internal/vm/manager.go ReserveRAMGB; host_ram_gb below).
+HOST_RAM_MIN_GB=8
 UDEV_RULE=/etc/udev/rules.d/90-runcrate-host.rules
 DISABLED_UNITS="$CONF_DIR/disabled-units"
 # QEMU runs as this unprivileged user (group kvm); the agent expects it.
@@ -451,6 +452,12 @@ free_gb() {
 
 # mem_gb: the machine's RAM in GB, rounded.
 mem_gb() { awk '/^MemTotal:/ {print int($2 / 1048576 + 0.5)}' "$MEMINFO" 2>/dev/null; }
+
+# host_ram_gb TOTAL: the RAM the agent keeps for a host of TOTAL GB.
+host_ram_gb() {
+	r=$((($1 * 12 + 99) / 100))
+	if [ "$r" -gt "$HOST_RAM_MIN_GB" ]; then echo "$r"; else echo "$HOST_RAM_MIN_GB"; fi
+}
 
 # https_ok URL: an HTTPS request to URL gets any answer.
 https_ok() {
@@ -867,8 +874,8 @@ run_check() {
 
 	mem=$(mem_gb)
 	if [ -z "$mem" ]; then report SKIP "RAM: can't read $MEMINFO" "" "RAM"
-	elif [ "$mem" -gt "$HOST_RAM_GB" ]; then report PASS "RAM: $mem GB ($HOST_RAM_GB GB stays with the host, the rest is for VMs)"
-	else report FAIL "RAM: $mem GB" "the agent keeps $HOST_RAM_GB GB for the host, so VMs need more than that: add RAM" "$HOST_RAM_GB GB RAM or less"; fi
+	elif [ "$mem" -gt "$(host_ram_gb "$mem")" ]; then report PASS "RAM: $mem GB ($(host_ram_gb "$mem") GB stays with the host, the rest is for VMs)"
+	else report FAIL "RAM: $mem GB" "the agent keeps at least $HOST_RAM_MIN_GB GB for the host, so VMs need more than that: add RAM" "$HOST_RAM_MIN_GB GB RAM or less"; fi
 
 	if ! cpu_virt_on; then
 		report FAIL "CPU virtualization (VT-x / AMD-V): off" "turn on VT-x (Intel) or SVM (AMD) in the BIOS" "CPU virtualization off"

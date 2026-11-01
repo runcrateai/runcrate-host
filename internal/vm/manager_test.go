@@ -516,3 +516,12 @@ func TestMMIOWindowFitsBARs(t *testing.T) {
 		t.Fatal("minimum window is 32 GiB")
 	}
 }
+
+// The host keeps max(8 GB, 12% rounded up), as the control plane counts it.
+func TestReserveRAMGB(t *testing.T) {
+	for total, want := range map[int]int{16: 8, 64: 8, 66: 8, 67: 9, 188: 23, 504: 61, 512: 62, 2048: 246} {
+		if got := ReserveRAMGB(total); got != want {
+			t.Errorf("ReserveRAMGB(%d) = %d, want %d", total, got, want)
+		}
+	}
+}
