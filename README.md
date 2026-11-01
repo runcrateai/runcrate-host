@@ -110,6 +110,23 @@ Customers get a VM, never a process on your machine. What keeps them in it:
 - **Wiped after each customer.** When a rental ends, the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they can be rented again. A GPU whose scrub fails is held back.
 - **Signed agent and images, no downgrades.** The agent, the installer and the VM images are signed offline with Runcrate's ed25519 release key; the public key is built into the agent and into `install.sh`. The signature covers the kind of file, its version and its sha256, so a signed file can't be passed off as another. The installer checks the agent with `openssl` before installing it; the agent checks every VM image and every update, and refuses an update that is not newer than the running version. A compromised control plane or download server can only point at releases Runcrate signed.
 
+## Threat model
+
+What the design protects:
+
+- **The host from the customer.** Customer code runs only inside a KVM VM with the GPUs passed through by VFIO. The VM gets an egress-only routed /30, no inbound connections, and no route to the host, its networks, private ranges or anything in `blocked_cidrs`. Its QEMU runs as an unprivileged user of its own, under QEMU's seccomp sandbox (`-sandbox on`, no spawning or privilege changes).
+- **Customers from each other.** There is no VM-to-VM traffic and no shared layer 2. After each rental the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they are rented again.
+- **Customers and hosts from a bad agent update.** Updates and VM images must be signed with Runcrate's offline release key, and the agent refuses an update that is not newer than the version it runs.
+
+What it does not protect: **a host owner with root can read a customer VM's memory and disk**, as with any VM on hardware someone else runs. There is no confidential computing (encrypted, attested VMs) today.
+
+What Runcrate does about that instead:
+
+- Host companies accept the Host Partner Terms at signup. Those terms forbid opening, inspecting, copying or snapshotting a VM, its memory, disks or traffic, trying to identify a customer, and changing or getting around the host agent.
+- Host companies and their contacts are screened against sanctions lists (OFAC SDN and Consolidated, EU, UK) at signup and every day after. A new finding stops their listings and payouts until a person decides.
+- Customers are shown options by GPU model, region and tier, never by host company. Hosts see each rental under a pseudonym, never the customer's identity. A VM's internet traffic does leave through the host's own connection, so its public IP is the host's.
+- A storage volume's keys travel in the VM's first-boot script, which a host's operator could read. So a launch with a volume goes only to a Datacenter host (a site Runcrate has verified), never to a Community one.
+
 ## What the benchmark verifies
 
 On Runcrate's command (a new host runs one before it is listed), the agent boots a throwaway VM from the current signed VM image, its sha256 and signature checked, and reports:
@@ -200,4 +217,4 @@ Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which ve
 
 ## License
 
-The source is published so that anyone running the Runcrate host agent on their machines can read exactly what it does; see [LICENSE](LICENSE). The official releases at `get.runcrate.ai` are signed with Runcrate's release key (see How isolation works), and only those releases may run as a Runcrate host.
+The source is published so that anyone running the Runcrate host agent on their machines can read exactly what it does; see [LICENSE](LICENSE). The official releases at `get.runcrate.ai` are signed with Runcrate's ed25519 release key: the installer checks the agent's signature before installing it, and the agent checks the signature of every update and VM image it takes. The Host Partner Terms that host companies accept forbid changing or getting around the host agent.
