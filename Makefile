@@ -1,11 +1,17 @@
 VERSION ?= dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: test release clean
+.PHONY: test check-models release clean
 
 test:
 	go test -race ./...
 	sh hack/test-install.sh
+
+# install.sh's list of the GPU models Runcrate sells against the web app's
+# (APP: a checkout of Runcrate's web app).
+check-models:
+	@test -n "$(APP)" || { echo "usage: make check-models APP=<Runcrate web app checkout>"; exit 2; }
+	sh hack/check-models.sh "$(APP)/src/lib/providers/gpu-names.ts"
 
 release:
 	mkdir -p out
