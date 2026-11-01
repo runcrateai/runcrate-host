@@ -1,6 +1,44 @@
 # runcrate-host
 
-Plug your GPU machines into Runcrate with one command. Runcrate sells their GPUs on demand, reserved or spot at the rates you set, and pays you out. You don't need a launch API, billing or a public IP.
+runcrate-host is the installer and agent that turn a bare-metal Linux server with NVIDIA GPUs into a Runcrate host: Runcrate rents its GPUs out on demand, reserved or spot, as KVM virtual machines with the GPUs passed through, at the rates the owner sets. The agent talks to Runcrate only over outbound HTTPS, so the server needs no public IP or open port.
+
+## Check a machine first
+
+```sh
+curl -fsSL https://get.runcrate.ai/host | sh -s -- --check
+```
+
+No account, no token and no root needed. It installs nothing, changes nothing and writes no files. Each line is PASS, WARN, FAIL or SKIP with a one-line fix, and the last line is the verdict: `READY`, `READY AFTER REBOOT` (the IOMMU is off and the install will turn it on) or `NOT READY` with the reasons. The exit code is 0 only when ready. It checks:
+
+- the OS (Ubuntu 22.04, Ubuntu 24.04 or Debian 12) and x86_64;
+- bare metal, not a VM (`systemd-detect-virt`, the DMI tables, the CPU's hypervisor flag);
+- CPU virtualization (VT-x / AMD-V) and `/dev/kvm`;
+- the IOMMU: IOMMU groups present, the kernel command line, the firmware's DMAR / IVRS table, and the kernel log when it is readable (usually root only; without root that line is SKIP);
+- each NVIDIA GPU: name, PCI address, whether it is a model Runcrate sells, its IOMMU group (only the card's own functions, such as HDMI audio, plus PCI bridges may share it), the driver it is on and what the install will do with it;
+- free space for VM disks (100 GB or more, at `--data-dir` if you pass it), outbound HTTPS to `get.runcrate.ai` and `www.runcrate.ai`, and RAM.
+
+Example, on a server with one H100 and no root:
+
+```
+PASS  CPU architecture: x86_64
+PASS  OS: Ubuntu 24.04.1 LTS
+PASS  Bare metal: no hypervisor found
+PASS  RAM: 504 GB (8 GB stays with the host, the rest is for VMs)
+PASS  CPU virtualization: on, /dev/kvm present
+PASS  IOMMU: on (IOMMU groups: 96)
+SKIP  IOMMU in the kernel log: dmesg is not readable here (most machines allow it to root only)
+PASS  GPU 0000:41:00.0: GH100 [H100 SXM5 80GB], sold as H100
+      IOMMU group 20: only this card (with 0000:41:00.1)
+      driver: nvidia; the install moves it to vfio-pci (stopping nvidia-persistenced and nvidia-fabricmanager if they run)
+PASS  Disk: 2000 GB free for VM disks at /var/lib/runcrate-host
+PASS  Outbound HTTPS to get.runcrate.ai
+PASS  Outbound HTTPS to www.runcrate.ai
+
+Skipped: kernel log (dmesg).
+Verdict: READY. Install: curl -fsSL https://get.runcrate.ai/host | sudo sh
+```
+
+## Install
 
 ```sh
 curl -fsSL https://get.runcrate.ai/host | sudo sh
@@ -50,14 +88,7 @@ The agent calls Runcrate every 10 seconds over HTTPS with the host's state (VMs,
 | `reclaim_notice` | Spot only: tells the VM it will be reclaimed (see below). |
 | `drain` | Takes no new rentals; running ones finish. |
 | `benchmark` | Boots a throwaway VM from the VM image Runcrate currently names (downloaded and its sha256 and signature checked first when it isn't on the host yet) that tests every free GPU (a memory test over nearly all VRAM, an FP16 matrix multiply checked against the CPU, `nvidia-smi`), and measures disk, internet and, for hosts on the same site, host-to-host bandwidth (iperf3, and ib_write_bw with InfiniBand). The same VM checks its isolation: it must reach the internet, DNS, the metadata server and every Runcrate tunnel gateway customers are reached through (one check per gateway, `gateway_<id>`, passing only when the gateway answers with an SSH banner), and must not reach this host, its gateway, the Docker bridge, private ranges, CGNAT or link-local addresses. Meanwhile the host checks from a throwaway network namespace that a machine on your LAN, routing through it, can't open a TCP connection to the VM. The results, and the checks of the image the VM booted, show on the host's page. |
-| `update_agent` | Downloads a new agent over HTTPS, checks its sha256, swaps it in and restarts. The previous binary stays at `/usr/local/bin/runcrate-host.prev`. |
-
-Customer VMs are isolated from your network and from each other:
-
-- each VM has its own tap device and a /30 from `10.254.0.0/16` (`vm_subnet` in the config), with no shared layer 2 between VMs;
-- the firewall (nftables table `inet runcrate_host`) lets a VM reach the internet through NAT and nothing else: not the host, not other VMs, not private, link-local or carrier NAT ranges, and nothing from outside can open a connection into a VM. It is re-applied every 5 seconds, and whenever the agent is not running (stopped, crashed, updating or delisted) every VM's network is set down, so isolation never depends on a firewall nobody is watching;
-- the only host service a VM can reach is the metadata server at `http://169.254.169.254`, which answers each VM only about itself;
-- if Docker or ufw set the iptables FORWARD policy to DROP, the agent adds two narrow accept rules for its own `rc-*` interfaces; if IPv4 forwarding was off before the install, the agent drops any other forwarding so the host doesn't start routing for anything else.
+| `update_agent` | Downloads the new agent over HTTPS and installs it only if it is signed with Runcrate's release key (see below), matches the sha256 it was sent and is newer than the running version; then restarts. The previous binary stays at `/usr/local/bin/runcrate-host.prev`. |
 
 ### Spot reclaim notice inside the VM
 
@@ -65,6 +96,34 @@ When you reclaim a spot GPU, the customer's VM sees it two ways, within 5 second
 
 - the file `/run/runcrate/reclaim-notice.json`;
 - `http://169.254.169.254/runcrate/v1/reclaim-notice` (404 until there is a notice, then `{"reclaim": true, "vm_id", "deadline_at", "seconds_remaining"}`), and the AWS-shaped `http://169.254.169.254/latest/meta-data/spot/instance-action`.
+
+## How isolation works
+
+Customers get a VM, never a process on your machine. What keeps them in it:
+
+- **GPUs by VFIO passthrough.** Each GPU, with the other functions of the same card (HDMI audio, USB-C), is bound to `vfio-pci` and handed to one VM. A GPU is used only when its IOMMU group holds nothing else but PCI bridges, so no other device shares its DMA isolation; a kernel booted with `pcie_acs_override` (which fakes IOMMU groups) is refused.
+- **One unprivileged QEMU user per VM slot.** Each VM's QEMU runs as its own user (`runcrate-vm-<slot>`, group `runcrate-vm`, in `kvm`), so one VM can't reach another's disk, sockets or process.
+- **An egress-only routed /30 per VM.** Each VM has its own tap device and a /30 from `10.254.0.0/16` (`vm_subnet` in the config), with no shared layer 2 between VMs. The firewall (nftables table `inet runcrate_host`) lets a VM reach the internet through NAT and nothing else: not the host, not other VMs, not private, link-local or carrier NAT ranges, and nothing in `blocked_cidrs`.
+- **No inbound connections.** Nothing outside can open a connection into a VM. Customers reach their VM through a tunnel the VM itself opens, outbound, to a Runcrate gateway.
+- **The firewall is re-applied every 5 seconds**, and whenever the agent is not running (stopped, crashed, updating or delisted) every VM's network is set down, so isolation never depends on rules nobody is watching. If Docker or ufw set the iptables FORWARD policy to DROP, the agent adds two narrow accept rules for its own `rc-*` interfaces; if IPv4 forwarding was off before the install, the agent drops any other forwarding so the host doesn't start routing for anything else.
+- **Metadata on a privileged port.** A VM's `http://169.254.169.254` is redirected to the agent's metadata server on host port 980, below 1024 so only root can bind it, and the port is open only to the VMs' own interfaces. It answers each VM only about itself, and it is the one host service a VM can reach.
+- **Wiped after each customer.** When a rental ends, the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they can be rented again. A GPU whose scrub fails is held back.
+- **Signed agent and images, no downgrades.** The agent, the installer and the VM images are signed offline with Runcrate's ed25519 release key; the public key is built into the agent and into `install.sh`. The signature covers the kind of file, its version and its sha256, so a signed file can't be passed off as another. The installer checks the agent with `openssl` before installing it; the agent checks every VM image and every update, and refuses an update that is not newer than the running version. A compromised control plane or download server can only point at releases Runcrate signed.
+
+## What the benchmark verifies
+
+On Runcrate's command (a new host runs one before it is listed), the agent boots a throwaway VM from the current signed VM image, its sha256 and signature checked, and reports:
+
+- **every free GPU:** a memory test over nearly all of its VRAM, an FP16 matrix multiply checked against the CPU, and `nvidia-smi`;
+- **disk, internet and, for hosts on the same site, host-to-host bandwidth** (iperf3, and ib_write_bw with InfiniBand);
+- **isolation, from inside the VM:** it must reach the internet, DNS, the metadata server and every Runcrate tunnel gateway customers come in through (each must answer with an SSH banner), and must not reach this host, its gateway, the Docker bridge, private ranges (10/8, 172.16/12, 192.168/16), carrier NAT (100.64/10) or other link-local addresses;
+- **isolation, from outside:** from a throwaway network namespace routed through the host like a machine on your LAN, the host checks that it can't open a TCP connection to the VM.
+
+A GPU is sold only after it passes on the VM image customers get. The results show on the host's page in your dashboard.
+
+## Measured on real hardware
+
+<!-- H100 numbers from the 1 Nov run go here -->
 
 ## What the agent can and can't see
 
@@ -111,7 +170,7 @@ This stops every VM, overwrites and deletes their disks, removes the VM network 
 ## Development
 
 ```sh
-go test ./...
+make test                            # go test -race ./... and hack/test-install.sh (install.sh and --check on fake machines)
 make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
 RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
@@ -119,6 +178,8 @@ RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
 ```
 
 The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cudart, cuBLAS), Fabric Manager and `rc-gpubench`. Everything a customer machine needs beyond that comes from its setup script at first boot.
+
+`install.sh` carries the list of GPU models Runcrate sells, for `--check`; Runcrate's web app decides at registration with its own copy. `make check-models APP=<web app checkout>` runs both on every NVIDIA name in pci.ids and fails when they disagree.
 
 ### Publishing a release
 
@@ -136,3 +197,7 @@ Releases are served from `get.runcrate.ai`, the Worker in `hack/get-worker` (`cd
 | `https://get.runcrate.ai/releases/<version>/...` | the same, kept for good |
 
 Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which verifies both signatures with `openssl` against the key in this checkout's `install.sh` and checks that the installer, the latest agent and the versioned copy agree. A version is never replaced by a different build, and `latest` never moves back to an older version (to roll back, publish the old code as a newer version); a failed upload is finished by running the same command again.
+
+## License
+
+The source is published so that anyone running the Runcrate host agent on their machines can read exactly what it does; see [LICENSE](LICENSE). The official releases at `get.runcrate.ai` are signed with Runcrate's release key (see How isolation works), and only those releases may run as a Runcrate host.
