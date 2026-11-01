@@ -70,7 +70,7 @@ Every step checks before it changes anything, so running it again is safe.
 1. Checks the OS, CPU virtualization, the GPUs and the IOMMU.
 2. Installs QEMU/KVM, OVMF, nftables, genisoimage and iperf3 (and perftest when InfiniBand is present).
 3. Creates the unprivileged `runcrate-vm` user and group, with a udev rule giving group `kvm` access to `/dev/vhost-net`. Each VM's QEMU runs confined as its own user (`runcrate-vm-<slot>`, group `runcrate-vm`, in `kvm`), which the agent adds on first use, so one VM can't reach another's disk, sockets or process.
-4. Downloads the agent, checks its ed25519 signature against Runcrate's release key with `openssl` (it refuses to install anything unsigned), and installs it at `/usr/local/bin/runcrate-host`.
+4. Downloads the agent, checks its ed25519 signature against Runcrate's release key with `openssl` (it refuses a download that isn't signed), and installs it at `/usr/local/bin/runcrate-host`. The `--binary PATH` option, for testing, installs a local build instead, with no signature check.
 5. Takes the GPUs off the host: stops `nvidia-persistenced` and `nvidia-fabricmanager` if they run, and moves each GPU (and the other functions of its card, such as HDMI audio) to `vfio-pci`. When Runcrate gets every GPU, a modprobe rule also claims them at boot before any host driver.
 6. Registers the machine with your token. The host credential it gets back is stored in `/etc/runcrate-host/credential`, readable by root only.
 7. Starts two systemd services: `runcrate-host-gpus` (binds the GPUs at boot) and `runcrate-host` (the agent).
@@ -255,4 +255,4 @@ Then it runs `hack/check-install.sh https://get.runcrate.ai <version>`, which ve
 
 ## License
 
-The source is published so that anyone running the Runcrate host agent on their machines can read exactly what it does; see [LICENSE](LICENSE). The official releases at `get.runcrate.ai` are signed with Runcrate's ed25519 release key: the installer checks the agent's signature before installing it, and the agent checks the signature of every update and VM image it takes. The Host Partner Terms that host companies accept forbid changing or getting around the host agent.
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). You can fork and change the code under that license. The official releases at `get.runcrate.ai` are signed with Runcrate's ed25519 release key: the installer checks the agent's signature before installing it, and the agent checks the signature of every update and VM image it takes, so a downloaded agent, update or VM image not signed with that key is refused. Hosts that sell on Runcrate must run the official releases: the Host Partner Terms that host companies accept forbid changing or getting around the host agent.
