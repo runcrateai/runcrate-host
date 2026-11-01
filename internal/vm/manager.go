@@ -43,13 +43,21 @@ const (
 // Host reserves: what the partner's OS keeps for itself.
 const (
 	reserveThreads = 2
-	reserveRAMGB   = 8
 	reserveDiskGB  = ReserveDiskGB
 	// ReserveDiskGB is disk the agent never gives to VMs.
 	ReserveDiskGB = 10
 	// ImageAllowanceGB is room kept for base images when reporting disk.
 	ImageAllowanceGB = 20
 )
+
+// ReserveRAMGB is the RAM a host of totalGB keeps for itself: at least 8 GB,
+// and 12% (rounded up) of a larger host's, the control plane's rule
+// (runcrate_app partner-hosts/inventory.ts). A passthrough VM pins all of its
+// memory, so the host's share must cover the kernel, QEMU and the IOMMU's
+// page tables: a 180 GB VM on a 188 GB H100 host (8 kept) was killed out of
+// memory as it started; a 168 GB one ran (2026-11-01 e2e). install.sh's
+// --check (host_ram_gb) says the same.
+func ReserveRAMGB(totalGB int) int { return max(8, (totalGB*12+99)/100) }
 
 var idRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
 
@@ -509,8 +517,8 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 	if m.HostThreads > 0 && usedCPU+s.VCPUs > m.HostThreads-reserveThreads {
 		return nil, false, fmt.Errorf("%w: %d vcpus asked, %d free", ErrCapacity, s.VCPUs, m.HostThreads-reserveThreads-usedCPU)
 	}
-	if m.HostRAMGB > 0 && usedRAM+s.RAMGB > m.HostRAMGB-reserveRAMGB {
-		return nil, false, fmt.Errorf("%w: %d GB RAM asked, %d free", ErrCapacity, s.RAMGB, m.HostRAMGB-reserveRAMGB-usedRAM)
+	if reserve := ReserveRAMGB(m.HostRAMGB); m.HostRAMGB > 0 && usedRAM+s.RAMGB > m.HostRAMGB-reserve {
+		return nil, false, fmt.Errorf("%w: %d GB RAM asked, %d free", ErrCapacity, s.RAMGB, m.HostRAMGB-reserve-usedRAM)
 	}
 	// VM disks are thin: count what every VM may still grow into, not only
 	// what the filesystem has free now.
@@ -1156,8 +1164,8 @@ func (m *Manager) RunEphemeral(ctx context.Context, id, owner, image string, gpu
 	if m.HostThreads > 0 && m.HostThreads-reserveThreads < vcpus {
 		vcpus = max(1, m.HostThreads-reserveThreads)
 	}
-	if m.HostRAMGB > 0 && m.HostRAMGB-reserveRAMGB < ram {
-		ram = max(4, m.HostRAMGB-reserveRAMGB)
+	if m.HostRAMGB > 0 && m.HostRAMGB-ReserveRAMGB(m.HostRAMGB) < ram {
+		ram = max(4, m.HostRAMGB-ReserveRAMGB(m.HostRAMGB))
 	}
 	if _, err := m.Create(ctx, Spec{ID: id, GPUIndexes: gpus, VCPUs: vcpus, RAMGB: ram, ImageVersion: image, CloudInit: script, Ephemeral: true, Owner: owner}); err != nil {
 		return nil, "", err

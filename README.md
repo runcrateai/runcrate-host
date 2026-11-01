@@ -23,7 +23,7 @@ Example, on a server with one H100 and no root:
 PASS  CPU architecture: x86_64
 PASS  OS: Ubuntu 24.04.1 LTS
 PASS  Bare metal: no hypervisor found
-PASS  RAM: 504 GB (8 GB stays with the host, the rest is for VMs)
+PASS  RAM: 504 GB (61 GB stays with the host, the rest is for VMs)
 PASS  CPU virtualization: on, /dev/kvm present
 PASS  IOMMU: on (IOMMU groups: 96)
 SKIP  IOMMU in the kernel log: dmesg is not readable here (most machines allow it to root only)

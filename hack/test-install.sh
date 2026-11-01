@@ -163,6 +163,7 @@ dev 0000:40:01.0 0x8086 0x1234 0x060400 pcieport 20
 out=$(run_case)
 has "PASS  GPU 0000:41:00.0: GH100 [H100 SXM5 80GB], sold as H100" "ready machine"
 has "IOMMU group 20: only this card (with 0000:41:00.1)" "ready machine"
+has "PASS  RAM: 504 GB (61 GB stays with the host, the rest is for VMs)" "ready machine: 12% kept"
 has "driver: nvidia; the install moves it to vfio-pci" "ready machine"
 has "PASS  IOMMU: on (IOMMU groups: 1)" "ready machine"
 has "kernel log: DMAR: IOMMU enabled" "ready machine"
@@ -182,8 +183,10 @@ has "exit=0" "shared group"
 # 7c. Only a card Runcrate doesn't sell: not ready.
 new_machine
 dev 0000:01:00.0 0x10de 0x1b80 0x030000 nouveau 5
+echo "MemTotal: 33554432 kB" > "$M/meminfo"
 out=$(run_case)
 has "WARN  GPU 0000:01:00.0: GP104 [GeForce GTX 1080], not a model Runcrate sells" "unsold card"
+has "PASS  RAM: 32 GB (8 GB stays with the host, the rest is for VMs)" "unsold card: 8 GB kept at least"
 has "Verdict: NOT READY (no GPU Runcrate can rent out)" "unsold card"
 has "exit=1" "unsold card"
 
