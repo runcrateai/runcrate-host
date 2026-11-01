@@ -98,17 +98,23 @@ Runcrate host installer
 EOF
 }
 
+# need_value OPTION VALUE: an option that takes a value got one. A missing
+# value, or the next option in its place (--name --check), stops everything.
+need_value() {
+	case "${2-}" in ''|-*) die "$1 needs a value" ;; esac
+}
+
 parse_args() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--token) die "--token is gone: the token would show in ps. Put it in a root-only file and pass --token-file, or leave it out to be asked for it" ;;
-			--token-file) TOKEN_FILE="${2:-}"; shift 2 ;;
-			--name) HOST_NAME="${2:-}"; shift 2 ;;
-			--site) SITE="${2:-}"; shift 2 ;;
-			--gpus) GPUS="${2:-}"; shift 2 ;;
-			--data-dir) DATA_DIR="${2:-}"; shift 2 ;;
-			--api) API="${2:-}"; shift 2 ;;
-			--binary) BINARY="${2:-}"; shift 2 ;;
+			--token-file) need_value "$@"; TOKEN_FILE=$2; shift 2 ;;
+			--name) need_value "$@"; HOST_NAME=$2; shift 2 ;;
+			--site) need_value "$@"; SITE=$2; shift 2 ;;
+			--gpus) need_value "$@"; GPUS=$2; shift 2 ;;
+			--data-dir) need_value "$@"; DATA_DIR=$2; shift 2 ;;
+			--api) need_value "$@"; API=$2; shift 2 ;;
+			--binary) need_value "$@"; BINARY=$2; shift 2 ;;
 			--yes|-y) YES=1; shift ;;
 			--uninstall) UNINSTALL=1; shift ;;
 			--check) CHECK=1; shift ;;
@@ -287,18 +293,27 @@ pci_driver() {
 	printf '%s\n' "${l##*/}"
 }
 
+# pci_ids_file: the pci.ids the agent reads (the first one found), or nothing.
+pci_ids_file() {
+	for f in $PCI_IDS; do
+		if [ -r "$f" ]; then printf '%s\n' "$f"; return 0; fi
+	done
+}
+
+# pci_device_id ADDR: the PCI device id, lower case, without 0x.
+pci_device_id() { sed 's/^0x//' "$PCI_DEVICES/$1/device" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
+
 # pci_ids_name ADDR: the GPU's name from pci.ids, as the agent reads it
 # (internal/hw/pci.go LoadPCIIDs), or "NVIDIA <device id>".
 pci_ids_name() {
-	dev=$(sed 's/^0x//' "$PCI_DEVICES/$1/device" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+	dev=$(pci_device_id "$1")
 	n=""
-	for f in $PCI_IDS; do
-		[ -r "$f" ] || continue
+	f=$(pci_ids_file)
+	if [ -n "$f" ]; then
 		n=$(awk -v id="$dev" '/^#/ || /^$/ {next}
 			/^[^\t]/ {nv = ($0 ~ /^10de /); next}
 			nv && /^\t[^\t]/ && tolower(substr($0, 2, 4)) == id && substr($0, 6, 1) == " " {s = substr($0, 7); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); print s; exit}' "$f")
-		break
-	done
+	fi
 	printf '%s\n' "${n:-NVIDIA $dev}"
 }
 
@@ -776,7 +791,14 @@ check_gpus() {
 			sold="sold as $model"
 		else
 			case "$name" in
-				"NVIDIA "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) sold="model not identified here (no pci.ids and no NVIDIA driver)" ;;
+				"NVIDIA "[0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+					if [ -n "$(pci_ids_file)" ]; then
+						sold="model not identified: this machine's pci.ids doesn't list 10de:$(pci_device_id "$a")"
+						unknown_fix="nothing to do: the benchmark identifies it from inside the VM"
+					else
+						sold="model not identified: no pci.ids found and no NVIDIA driver"
+						unknown_fix="install pciutils (it brings pci.ids) and run the check again; the install does the same before registering"
+					fi ;;
 				*) sold="not a model Runcrate sells"; ok=0 ;;
 			esac
 		fi
@@ -788,7 +810,7 @@ check_gpus() {
 		if [ "$ok" -eq 1 ] && [ -n "$model" ]; then
 			report PASS "GPU $a: $name, $sold"
 		elif [ "$ok" -eq 1 ]; then
-			report WARN "GPU $a: $name, $sold" "install pciutils (it brings pci.ids) and run the check again; the install does the same before registering"
+			report WARN "GPU $a: $name, $sold" "$unknown_fix"
 		elif [ -n "$blocker" ] && [ "$blocker" != "IOMMU is off" ]; then
 			case "$blocker" in
 				*pcie_acs_override*) fix="remove pcie_acs_override from the kernel command line" ;;

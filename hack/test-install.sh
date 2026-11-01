@@ -1,6 +1,7 @@
 #!/bin/sh
 # test-install.sh: checks install.sh (its IOMMU boot loader handling, which GPU models it
-# counts as sold and what --check reports) against a fake
+# counts as sold, its option parsing, its machine checks, what --check reports and that
+# --check changes nothing) against a fake
 # machine in a temp dir (no root, nothing on this machine is touched).
 #   sh hack/test-install.sh
 # The variables this sets are install.sh's, which shellcheck does not follow into.
@@ -15,6 +16,7 @@ mkdir -p "$T/bin" "$T/grub.d" "$T/iommu_groups/0"
 # update-grub is faked: it only records that it ran.
 printf '#!/bin/sh\ntouch "%s/update-grub-ran"\n' "$T" > "$T/bin/update-grub"
 chmod +x "$T/bin/update-grub"
+ORIG_PATH=$PATH
 PATH="$T/bin:$PATH"
 
 . "$REPO/install.sh"
@@ -219,4 +221,78 @@ out=$(run_case)
 has "FAIL  IOMMU: on, but the kernel runs with pcie_acs_override" "acs override"
 has "exit=1" "acs override"
 
-echo "ok: install.sh keeps the IOMMU boot loader file across an uninstall and reinstall, and --check reports"
+# 7h. pci.ids present but without this device: the benchmark names it. No pci.ids at all: install pciutils.
+new_machine
+dev 0000:41:00.0 0x10de 0x2901 0x030200 "" 20
+out=$(run_case)
+has "WARN  GPU 0000:41:00.0: NVIDIA 2901, model not identified: this machine's pci.ids doesn't list 10de:2901" "unlisted device"
+has "fix: nothing to do: the benchmark identifies it from inside the VM" "unlisted device"
+hasnt "pciutils" "unlisted device"
+rm -f "$M/pci.ids"
+out=$(run_case)
+has "model not identified: no pci.ids found and no NVIDIA driver" "no pci.ids"
+has "install pciutils" "no pci.ids"
+
+# 8. check_machine, the install's own checks, on the same fake machines.
+# check_case: check_machine against the fake machine; its output and "exit=N".
+check_case() {
+	(
+		. "$REPO/install.sh"
+		OS_RELEASE="$M/os-release"; CPUINFO="$M/cpuinfo"; PCI_DEVICES="$M/devices"; DMI_DIR="$M/dmi"; PCI_IDS="$M/pci.ids"
+		FORCE=${FAKE_FORCE:-0}
+		check_machine
+	) 2>&1 && echo "exit=0" || echo "exit=$?"
+}
+new_machine
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+out=$(check_case)
+has "OS: Ubuntu 24.04.1 LTS" "check_machine ready"
+has "  0000:41:00.0 GH100 [H100 SXM5 80GB]" "check_machine ready"
+has "exit=0" "check_machine ready"
+echo "QEMU" > "$M/dmi/sys_vendor"
+out=$(check_case)
+has "Error: this is a virtual machine (QEMU SYS-421GE); Runcrate hosts must be bare metal" "check_machine vm"
+has "exit=1" "check_machine vm"
+out=$(FAKE_FORCE=1 check_case)
+has "exit=0" "check_machine vm with --force"
+new_machine
+out=$(check_case)
+has "Error: no NVIDIA GPU found" "check_machine no gpu"
+has "exit=1" "check_machine no gpu"
+printf 'vendor_id : GenuineIntel\nflags : fpu sse\n' > "$M/cpuinfo"
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+out=$(check_case)
+has "Error: CPU virtualization (VT-x / AMD-V) is off" "check_machine no vmx"
+
+# 9. Options that take a value refuse a missing one, or the next option in its place.
+for args in "--name --check" "--gpus" "--data-dir -y" "--token-file --check"; do
+	# shellcheck disable=SC2086
+	if out=$( (. "$REPO/install.sh"; parse_args $args; echo parsed) 2>&1); then fail "parse_args $args went on: $out"; fi
+	case "$out" in *"needs a value"*) ;; *) fail "parse_args $args: $out" ;; esac
+done
+
+# 10. sh install.sh --check, as a process: every command that changes a machine is a stub
+#     that records the call and fails, and nothing is written in its working directory.
+G="$T/guard"
+mkdir -p "$G" "$T/cwd" "$T/home"
+for c in apt apt-get dpkg debconf-set-selections modprobe rmmod insmod systemctl update-grub update-initramfs \
+	udevadm useradd userdel usermod groupadd groupdel reboot shutdown install mkdir rm cp mv ln chmod chown \
+	touch tee dd stty mount umount sysctl nft iptables ip6tables ip tc sudo su; do
+	printf '#!/bin/sh\necho "%s $*" >> "%s/mutations"\nexit 97\n' "$c" "$T" > "$G/$c"
+	chmod +x "$G/$c"
+done
+cp "$T/bin/curl" "$T/bin/nvidia-smi" "$T/bin/dmesg" "$G/"
+for who in user root; do
+	if [ "$who" = root ]; then printf '#!/bin/sh\n[ "$1" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n' > "$G/id"; chmod 755 "$G/id"; fi
+	# The real install.sh, run the way curl | sh runs it, with only the guard in front of PATH.
+	out=$(cd "$T/cwd" && HOME="$T/home" PATH="$G:$ORIG_PATH" sh "$REPO/install.sh" --check 2>&1) && rc=0 || rc=$?
+	[ ! -s "$T/mutations" ] || { cat "$T/mutations" >&2; fail "--check as $who ran a mutating command"; }
+	case "$rc" in 0|1) ;; *) printf '%s\n' "$out" >&2; fail "--check as $who exited $rc" ;; esac
+	has "Verdict: " "--check as $who"
+	[ -z "$(ls -A "$T/cwd")$(ls -A "$T/home")" ] || fail "--check as $who wrote files"
+done
+rm -f "$G/id"
+out=$(cd "$T/cwd" && PATH="$G:$ORIG_PATH" sh "$REPO/install.sh" --name --check 2>&1) && fail "--name --check went on: $out"
+has "--name needs a value" "--name --check"
+[ ! -s "$T/mutations" ] || fail "--name --check ran a mutating command"
+echo "ok: install.sh keeps the IOMMU boot loader file, its checks and --check report the fake machines, and --check changes nothing"
