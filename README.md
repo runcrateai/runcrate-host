@@ -119,8 +119,9 @@ Customers get a VM, never a process on your machine. What keeps them in it:
   printf 'runcrate-install\n%s\n%s\n' "$(head -n1 host.version | tr -d '[:space:]')" \
     "$(sha256sum host | cut -d' ' -f1)" > host.msg
   base64 -d < host.sig > host.sigbin
+  # sudo sh host runs only when openssl prints "Signature Verified Successfully"
   openssl pkeyutl -verify -pubin -inkey runcrate-release.pem -rawin -in host.msg -sigfile host.sigbin \
-    && sudo sh host     # runs only when openssl prints "Signature Verified Successfully"
+    && sudo sh host
   ```
 
   The key is the same `RELEASE_PUBKEY` as in `install.sh` and `internal/release`. The signed message is `runcrate-install`, the version and the sha256, one per line. `-rawin` needs OpenSSL 3.
