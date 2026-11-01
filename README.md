@@ -57,7 +57,7 @@ The installer refuses a token file that is not owned by root or that anyone else
 
 - Bare metal, x86_64. Not a VM: GPUs are passed through to customer VMs, which needs the real hardware.
 - Ubuntu 22.04, Ubuntu 24.04 or Debian 12.
-- NVIDIA GPUs: datacenter cards (A100, H100, H200, B200, L40S, RTX 6000 and others) or the GeForce RTX 3090, 4090 and 5090. Other GeForce cards aren't sold on Runcrate.
+- NVIDIA GPUs: datacenter cards (A100, H100, H200, B200, L40S, RTX 6000 Ada, RTX PRO 6000 but not the Max-Q, and others) or the GeForce RTX 3090, 4090 and 5090. Other GeForce cards aren't sold on Runcrate.
 - Virtualization (VT-x / AMD-V) and IOMMU (VT-d / AMD-Vi) turned on in the BIOS. If the kernel has the IOMMU off, the installer shows the exact GRUB line, adds it and reboots when you say yes (or with `--yes`). Then run the same command again.
 - Outbound HTTPS. No inbound ports, NAT is fine. The one exception: while a benchmark runs on two or more hosts of the same site, iperf3 (and ib_write_bw with InfiniBand) listens on the hosts' private addresses for up to 5 minutes, open only to the site's other hosts.
 - Fast local disk for VM disks, 100 GB or more free (`--data-dir` to choose where). The data directory must be new or empty: the agent marks it as its own (`.runcrate-host-data`) and never shares it with your files.
@@ -107,25 +107,40 @@ Customers get a VM, never a process on your machine. What keeps them in it:
 - **No inbound connections.** Nothing outside can open a connection into a VM. Customers reach their VM through a tunnel the VM itself opens, outbound, to a Runcrate gateway.
 - **The firewall is re-applied every 5 seconds**, and whenever the agent is not running (stopped, crashed, updating or delisted) every VM's network is set down, so isolation never depends on rules nobody is watching. If Docker or ufw set the iptables FORWARD policy to DROP, the agent adds two narrow accept rules for its own `rc-*` interfaces; if IPv4 forwarding was off before the install, the agent drops any other forwarding so the host doesn't start routing for anything else.
 - **Metadata on a privileged port.** A VM's `http://169.254.169.254` is redirected to the agent's metadata server on host port 980, below 1024 so only root can bind it, and the port is open only to the VMs' own interfaces. It answers each VM only about itself, and it is the one host service a VM can reach.
-- **Wiped after each customer.** When a rental ends, the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they can be rented again. A GPU whose scrub fails is held back.
-- **Signed agent and images, no downgrades.** The agent, the installer and the VM images are signed offline with Runcrate's ed25519 release key; the public key is built into the agent and into `install.sh`. The signature covers the kind of file, its version and its sha256, so a signed file can't be passed off as another. The installer checks the agent with `openssl` before installing it; the agent checks every VM image and every update, and refuses an update that is not newer than the running version. A compromised control plane or download server can only point at releases Runcrate signed.
+- **Wiped after each customer.** When a rental ends, the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they can be rented again (the `scrub_gpus` setting in `config.json`, on by default). A GPU whose scrub fails is held back.
+- **Signed agent and images, no downgrades.** The agent, the installer and the VM images are signed with Runcrate's ed25519 release key, held by the publisher, never on the control plane or the download server; the public key is built into the agent and into `install.sh`. The signature covers the kind of file, its version and its sha256, so a signed file can't be passed off as another. The installer checks the agent with `openssl` before installing it; the agent checks every VM image and every update, and refuses an update that is not newer than the running version. Once installed, a compromised control plane or download server can only point the agent at releases Runcrate signed.
+- **The first install trusts get.runcrate.ai and TLS.** The installer you pipe into `sh` is not checked by itself, and it has no version floor: it installs whatever signed release is `latest`. To check the installer before running it:
+
+  ```sh
+  cd "$(mktemp -d)"
+  curl -fsSL --remote-name-all https://get.runcrate.ai/host https://get.runcrate.ai/host.sig https://get.runcrate.ai/host.version
+  printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' \
+    MCowBQYDK2VwAyEAYBrMXteHsZh26jJMcMZ3PI05QmTbNcd7gy9ALNlW2Yc= > runcrate-release.pem
+  printf 'runcrate-install\n%s\n%s\n' "$(head -n1 host.version | tr -d '[:space:]')" \
+    "$(sha256sum host | cut -d' ' -f1)" > host.msg
+  base64 -d host.sig > host.sigbin
+  openssl pkeyutl -verify -pubin -inkey runcrate-release.pem -rawin -in host.msg -sigfile host.sigbin
+  sudo sh host        # only after "Signature Verified Successfully"
+  ```
+
+  The key is the same `RELEASE_PUBKEY` as in `install.sh` and `internal/release`. The signed message is `runcrate-install`, the version and the sha256, one per line. `-rawin` needs OpenSSL 3.
 
 ## Threat model
 
 What the design protects:
 
 - **The host from the customer.** Customer code runs only inside a KVM VM with the GPUs passed through by VFIO. The VM gets an egress-only routed /30, no inbound connections, and no route to the host, its networks, private ranges or anything in `blocked_cidrs`. Its QEMU runs as an unprivileged user of its own, under QEMU's seccomp sandbox (`-sandbox on`, no spawning or privilege changes).
-- **Customers from each other.** There is no VM-to-VM traffic and no shared layer 2. After each rental the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they are rented again.
-- **Customers and hosts from a bad agent update.** Updates and VM images must be signed with Runcrate's offline release key, and the agent refuses an update that is not newer than the version it runs.
+- **Customers from each other.** There is no VM-to-VM traffic and no shared layer 2. After each rental the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they are rented again. This assumes the host runs the unmodified agent with its default config: the GPU scrub is the `scrub_gpus` setting (on by default), which the host can turn off, and the agent does not report that setting to Runcrate.
+- **Customers and hosts from a bad agent update.** Updates and VM images must be signed with Runcrate's release key, and the agent refuses an update that is not newer than the version it runs.
 
-What it does not protect: **a host owner with root can read a customer VM's memory and disk**, as with any VM on hardware someone else runs. There is no confidential computing (encrypted, attested VMs) today.
+What it does not protect: **a host owner with root can read and change everything on the machine**: a customer VM's memory and disk, its first-boot script and any credentials in it, its unencrypted traffic, and the agent itself. That holds for any VM on hardware someone else runs. There is no confidential computing (encrypted, attested VMs) today.
 
 What Runcrate does about that instead:
 
 - Host companies accept the Host Partner Terms at signup. Those terms forbid opening, inspecting, copying or snapshotting a VM, its memory, disks or traffic, trying to identify a customer, and changing or getting around the host agent.
-- Host companies and their contacts are screened against sanctions lists (OFAC SDN and Consolidated, EU, UK) at signup and every day after. A new finding stops their listings and payouts until a person decides.
-- Customers are shown options by GPU model, region and tier, never by host company. Hosts see each rental under a pseudonym, never the customer's identity. A VM's internet traffic does leave through the host's own connection, so its public IP is the host's.
-- A storage volume's keys travel in the VM's first-boot script, which a host's operator could read. So a launch with a volume goes only to a Datacenter host (a site Runcrate has verified), never to a Community one.
+- Host companies, and the person who accepted the terms for them, are screened against sanctions lists (OFAC SDN and Consolidated, EU, UK) at signup and every day after. A new finding stops their listings and payouts until a person decides.
+- Customers are shown options by GPU model, region and tier, never by host company. The dashboard shows hosts a pseudonym for each customer, never the customer's identity; a host with root can still learn it from the VM's contents. A VM's internet traffic leaves through the host's own connection, so its public IP is the host's.
+- A storage volume's keys travel in the VM's first-boot script, which a host's operator can read. So a launch with a volume goes only to a Datacenter host (a site Runcrate has verified), never to a Community one.
 
 ## What the benchmark verifies
 
@@ -133,14 +148,10 @@ On Runcrate's command (a new host runs one before it is listed), the agent boots
 
 - **every free GPU:** a memory test over nearly all of its VRAM, an FP16 matrix multiply checked against the CPU, and `nvidia-smi`;
 - **disk, internet and, for hosts on the same site, host-to-host bandwidth** (iperf3, and ib_write_bw with InfiniBand);
-- **isolation, from inside the VM:** it must reach the internet, DNS, the metadata server and every Runcrate tunnel gateway customers come in through (each must answer with an SSH banner), and must not reach this host, its gateway, the Docker bridge, private ranges (10/8, 172.16/12, 192.168/16), carrier NAT (100.64/10) or other link-local addresses;
+- **isolation, from inside the VM:** it must reach the internet, DNS, the metadata server and up to 8 Runcrate tunnel gateways customers come in through (each must answer with an SSH banner). It must not reach this host, its gateway or the Docker bridge, and it probes one address in each private range (10.0.0.1, 172.16.0.1, 192.168.0.1, 100.64.0.1, 169.254.1.1), which must not answer. The firewall blocks the whole ranges; the benchmark only samples them;
 - **isolation, from outside:** from a throwaway network namespace routed through the host like a machine on your LAN, the host checks that it can't open a TCP connection to the VM.
 
 A GPU is sold only after it passes on the VM image customers get. The results show on the host's page in your dashboard.
-
-## Measured on real hardware
-
-<!-- H100 numbers from the 1 Nov run go here -->
 
 ## What the agent can and can't see
 
@@ -190,8 +201,8 @@ This stops every VM, overwrites and deletes their disks, removes the VM network 
 make test                            # go test -race ./... and hack/test-install.sh (install.sh and --check on fake machines)
 make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
-RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
-  go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
+export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)"
+go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
 ```
 
 The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cudart, cuBLAS), Fabric Manager and `rc-gpubench`. Everything a customer machine needs beyond that comes from its setup script at first boot.
@@ -201,9 +212,11 @@ The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cuda
 ### Publishing a release
 
 ```sh
-hack/publish.sh 0.1.1                # from a clean checkout of a commit on origin/main; needs the release key (see the script)
+hack/publish.sh 0.1.1                # from a clean checkout of a commit on origin/main
 hack/check-install.sh                # any time: what partners download is signed and consistent
 ```
+
+`publish.sh` takes the release key and the bucket's credentials from the environment (`RUNCRATE_HOST_SIGNING_KEY`, `R2_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Export them from your secret store, as in `export RUNCRATE_HOST_SIGNING_KEY="$(...)"`, never typed on a command line; any secret left unset is asked for on the terminal with echo off.
 
 Releases are served from `get.runcrate.ai`, the Worker in `hack/get-worker` (`cd hack/get-worker && wrangler deploy`): it serves only these release files, read-only, from the R2 bucket `runcrate-host-images`. `publish.sh` builds the agent, signs it (`runcrate-host`) and `install.sh` (`runcrate-install`) with the release key, and uploads:
 

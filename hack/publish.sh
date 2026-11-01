@@ -1,13 +1,16 @@
 #!/bin/sh
 # publish.sh VERSION: builds, signs and uploads a release, then checks it.
 #
-# Run it from a clean checkout of a commit that is on origin/main, with the
-# release key and the bucket's credentials in the environment:
+# Run it from a clean checkout of a commit that is on origin/main. The release
+# key and the bucket's credentials come from the environment, filled from your
+# secret store so they are never typed on a command line, e.g.
 #
-#   RUNCRATE_HOST_SIGNING_KEY=<base64 ed25519 seed> \
-#   R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
-#   AWS_ACCESS_KEY_ID=<key id> AWS_SECRET_ACCESS_KEY=<secret> \
-#     hack/publish.sh 0.1.1
+#   export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)"
+#   export AWS_ACCESS_KEY_ID="$(...)" AWS_SECRET_ACCESS_KEY="$(...)"
+#   export R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+#   hack/publish.sh 0.1.1
+#
+# Any secret left unset is asked for on the terminal, with echo off.
 #
 # It builds the agent with `make release` (CGO_ENABLED=0 linux/amd64,
 # -X main.version), signs it as runcrate-host and install.sh as
@@ -32,15 +35,31 @@ ASSET=runcrate-host-linux-amd64
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# ask_secret PROMPT: one line from the terminal, not echoed.
+ask_secret() {
+	(: < /dev/tty) 2>/dev/null || return 0
+	printf '%s: ' "$1" > /dev/tty
+	stty -echo < /dev/tty
+	trap 'stty echo < /dev/tty' EXIT INT TERM
+	IFS= read -r s < /dev/tty || s=""
+	stty echo < /dev/tty
+	trap - EXIT INT TERM
+	printf '\n' > /dev/tty
+	printf '%s' "$s"
+}
+
 [ $# = 1 ] || die "usage: hack/publish.sh VERSION (e.g. 0.1.1)"
 # The secrets leave the environment here; each goes only to the one command that needs it.
 key=${RUNCRATE_HOST_SIGNING_KEY:-}
 access=${AWS_ACCESS_KEY_ID:-}
 secret=${AWS_SECRET_ACCESS_KEY:-}
 unset RUNCRATE_HOST_SIGNING_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-[ -n "$key" ] || die "set RUNCRATE_HOST_SIGNING_KEY to the release key (base64 ed25519 seed)"
+[ -n "$key" ] || key=$(ask_secret "Release signing key (base64 ed25519 seed)")
+[ -n "$key" ] || die "no release key: export RUNCRATE_HOST_SIGNING_KEY from your secret store"
 case "$R2" in https://*) ;; *) die "set R2_ENDPOINT to the bucket's S3 endpoint (https://...)" ;; esac
-[ -n "$access" ] && [ -n "$secret" ] || die "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to the bucket's credentials"
+[ -n "$access" ] || access=$(ask_secret "Bucket access key id")
+[ -n "$secret" ] || secret=$(ask_secret "Bucket secret access key")
+[ -n "$access" ] && [ -n "$secret" ] || die "no bucket credentials: export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from your secret store"
 V=$1
 printf '%s' "$V" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.]+)?$' ||
 	die "VERSION must look like 1.2.3 (optionally -suffix)"
