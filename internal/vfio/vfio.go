@@ -81,8 +81,8 @@ func (s Sysfs) Bind(addr string) error {
 }
 
 // busResetIDs are the vendor:device IDs proven to need a secondary bus reset
-// instead of FLR. 10de:2331, H100 PCIe (2026-11-01 e2e on a Latitude
-// g3-h100-small, host kernel 7.0): reset by FLR when vfio-pci opened it, the
+// instead of FLR. 10de:2331, H100 PCIe (2026-11-01 e2e on a bare-metal H100
+// PCIe test server, host kernel 7.0): reset by FLR when vfio-pci opened it, the
 // card came back with its BARs cleared and memory decode off. The guest
 // driver read 0xbadf0200 from BOOT_0 and called the card unsupported. Once
 // the BARs were written back, the first CUDA job hit Xid 95 (uncontained)
