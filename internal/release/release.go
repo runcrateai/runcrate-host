@@ -1,8 +1,9 @@
 // Package release checks Runcrate's release signatures. Agent binaries, VM
-// images and the installer script are signed offline with an ed25519 key
-// whose public half is built into the agent (and into install.sh), so a
-// compromised control plane or download server can't push code or images:
-// it can only point at releases Runcrate signed. The signature covers the
+// images and the installer script are signed with an ed25519 key held by the
+// publisher, never on the control plane or the download server; its public
+// half is built into the agent (and into install.sh), so once the agent is
+// installed a compromised control plane or download server can't push code or
+// images: it can only point at releases Runcrate signed. The signature covers the
 // kind, the version and the sha256, so a signed artifact can't be passed off
 // as another kind or another version.
 package release

@@ -1,8 +1,8 @@
 // Command sign writes <file>.sig for a release artifact. The ed25519 seed
 // comes from RUNCRATE_HOST_SIGNING_KEY (base64), e.g.
 //
-//	RUNCRATE_HOST_SIGNING_KEY=$(security find-generic-password -s runcrate-host-release-signing -a runcrate-host -w) \
-//	  go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64
+//	export RUNCRATE_HOST_SIGNING_KEY="$(<print the seed from your secret store>)"
+//	go run ./hack/sign -kind runcrate-host -version 0.1.0 out/runcrate-host-linux-amd64
 //
 // Kinds: runcrate-host (the agent binary), runcrate-vm (a VM image) and
 // runcrate-install (install.sh, served as get.runcrate.ai/host).
