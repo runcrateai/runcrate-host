@@ -109,7 +109,7 @@ Customers get a VM, never a process on your machine. What keeps them in it:
 - **Metadata on a privileged port.** A VM's `http://169.254.169.254` is redirected to the agent's metadata server on host port 980, below 1024 so only root can bind it, and the port is open only to the VMs' own interfaces. It answers each VM only about itself, and it is the one host service a VM can reach.
 - **Wiped after each customer.** When a rental ends, the VM's disk is overwritten with zeros and deleted, and a throwaway VM overwrites the GPUs' memory before they can be rented again (the `scrub_gpus` setting in `config.json`, on by default). A GPU whose scrub fails is held back.
 - **Signed agent and images, no downgrades.** The agent, the installer and the VM images are signed with Runcrate's ed25519 release key, held by the publisher, never on the control plane or the download server; the public key is built into the agent and into `install.sh`. The signature covers the kind of file, its version and its sha256, so a signed file can't be passed off as another. The installer checks the agent with `openssl` before installing it; the agent checks every VM image and every update, and refuses an update that is not newer than the running version. Once installed, a compromised control plane or download server can only point the agent at releases Runcrate signed.
-- **The first install trusts get.runcrate.ai and TLS.** The installer you pipe into `sh` is not checked by itself, and it has no version floor: it installs whatever signed release is `latest`. To check the installer before running it:
+- **The first install trusts get.runcrate.ai and TLS.** The installer you pipe into `sh` is not checked by itself, and it has no version floor: it installs whatever signed release is `latest`. To check the installer before running it (this proves Runcrate signed it, not that it is the newest one):
 
   ```sh
   cd "$(mktemp -d)"
@@ -118,9 +118,9 @@ Customers get a VM, never a process on your machine. What keeps them in it:
     MCowBQYDK2VwAyEAYBrMXteHsZh26jJMcMZ3PI05QmTbNcd7gy9ALNlW2Yc= > runcrate-release.pem
   printf 'runcrate-install\n%s\n%s\n' "$(head -n1 host.version | tr -d '[:space:]')" \
     "$(sha256sum host | cut -d' ' -f1)" > host.msg
-  base64 -d host.sig > host.sigbin
-  openssl pkeyutl -verify -pubin -inkey runcrate-release.pem -rawin -in host.msg -sigfile host.sigbin
-  sudo sh host        # only after "Signature Verified Successfully"
+  base64 -d < host.sig > host.sigbin
+  openssl pkeyutl -verify -pubin -inkey runcrate-release.pem -rawin -in host.msg -sigfile host.sigbin \
+    && sudo sh host     # runs only when openssl prints "Signature Verified Successfully"
   ```
 
   The key is the same `RELEASE_PUBKEY` as in `install.sh` and `internal/release`. The signed message is `runcrate-install`, the version and the sha256, one per line. `-rawin` needs OpenSSL 3.
@@ -201,8 +201,8 @@ This stops every VM, overwrites and deletes their disks, removes the VM network 
 make test                            # go test -race ./... and hack/test-install.sh (install.sh and --check on fake machines)
 make release VERSION=0.1.0           # out/runcrate-host-linux-amd64, .sha256 and .version
 sudo image/build.sh 20261026-1       # the VM image, on any x86_64 Linux box with KVM
-export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)"
-go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2   # .sig, uploaded next to the image
+( export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)"
+  go run ./hack/sign -kind runcrate-vm -version 20261026-1 out/runcrate-vm-20261026-1.qcow2 )   # .sig, uploaded next to the image
 ```
 
 The VM image is Ubuntu 24.04 with the NVIDIA open driver, the CUDA runtime (cudart, cuBLAS), Fabric Manager and `rc-gpubench`. Everything a customer machine needs beyond that comes from its setup script at first boot.
@@ -216,7 +216,15 @@ hack/publish.sh 0.1.1                # from a clean checkout of a commit on orig
 hack/check-install.sh                # any time: what partners download is signed and consistent
 ```
 
-`publish.sh` takes the release key and the bucket's credentials from the environment (`RUNCRATE_HOST_SIGNING_KEY`, `R2_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Export them from your secret store, as in `export RUNCRATE_HOST_SIGNING_KEY="$(...)"`, never typed on a command line; any secret left unset is asked for on the terminal with echo off.
+`publish.sh` takes the release key and the bucket's credentials from the environment (`RUNCRATE_HOST_SIGNING_KEY`, `R2_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Fill them from your secret store inside a subshell, so they never sit in your shell or on a command line:
+
+```sh
+( export RUNCRATE_HOST_SIGNING_KEY="$(...)" AWS_ACCESS_KEY_ID="$(...)" AWS_SECRET_ACCESS_KEY="$(...)" \
+    R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+  hack/publish.sh 0.1.1 )
+```
+
+Any secret left unset is asked for on the terminal with echo off.
 
 Releases are served from `get.runcrate.ai`, the Worker in `hack/get-worker` (`cd hack/get-worker && wrangler deploy`): it serves only these release files, read-only, from the R2 bucket `runcrate-host-images`. `publish.sh` builds the agent, signs it (`runcrate-host`) and `install.sh` (`runcrate-install`) with the release key, and uploads:
 

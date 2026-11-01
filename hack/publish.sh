@@ -3,12 +3,13 @@
 #
 # Run it from a clean checkout of a commit that is on origin/main. The release
 # key and the bucket's credentials come from the environment, filled from your
-# secret store so they are never typed on a command line, e.g.
+# secret store inside a subshell so they never sit in your shell or on a
+# command line, e.g.
 #
-#   export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)"
-#   export AWS_ACCESS_KEY_ID="$(...)" AWS_SECRET_ACCESS_KEY="$(...)"
-#   export R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
-#   hack/publish.sh 0.1.1
+#   ( export RUNCRATE_HOST_SIGNING_KEY="$(<print the base64 ed25519 seed from your secret store>)" \
+#       AWS_ACCESS_KEY_ID="$(...)" AWS_SECRET_ACCESS_KEY="$(...)" \
+#       R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+#     hack/publish.sh 0.1.1 )
 #
 # Any secret left unset is asked for on the terminal, with echo off.
 #
