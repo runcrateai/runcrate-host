@@ -86,7 +86,7 @@ Runcrate host installer
                   owned by root and readable by root only (chmod 600)
   --name N        host name shown in your dashboard (default: hostname)
   --site S        site name, to group hosts in one location
-  --gpus LIST     only these GPUs, as PCI addresses (0000:41:00.0,0000:42:00.0); default: all NVIDIA GPUs
+  --gpus LIST     only these GPUs, as PCI addresses (0000:41:00.0,0000:42:00.0); default: all NVIDIA and Intel Gaudi GPUs
   --data-dir D    where VM disks live (default /var/lib/runcrate-host); needs fast local disk
   --yes           don't ask: turn on IOMMU and reboot if needed
   --uninstall     stop every VM, wipe their disks, give the GPUs back, remove runcrate-host
@@ -288,6 +288,16 @@ nvidia_gpus() {
 	done
 }
 
+# gaudi_gpus: the PCI address of every Intel Gaudi (Habana, vendor 0x1da3)
+# processing accelerator, sorted (the agent's rule: internal/hw/pci.go IsGPU, the
+# Habana row of gpuVendors: class 0x12xx, or 0x03xx).
+gaudi_gpus() {
+	for d in "$PCI_DEVICES"/*; do
+		[ -r "$d/vendor" ] && [ "$(cat "$d/vendor")" = 0x1da3 ] || continue
+		case "$(cat "$d/class" 2>/dev/null)" in 0x12*|0x03*) printf '%s\n' "${d##*/}" ;; esac
+	done
+}
+
 # pci_driver ADDR: the driver bound to a PCI function, or "none".
 pci_driver() {
 	l=$(readlink "$PCI_DEVICES/$1/driver" 2>/dev/null) || l=none
@@ -305,17 +315,30 @@ pci_ids_file() {
 pci_device_id() { sed 's/^0x//' "$PCI_DEVICES/$1/device" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
 
 # pci_ids_name ADDR: the GPU's name from pci.ids, as the agent reads it
-# (internal/hw/pci.go LoadPCIIDs), or "NVIDIA <device id>".
+# (internal/hw/pci.go LoadPCIIDs), or the fallback name the agent gives it:
+# "NVIDIA <device id>", or for Gaudi "Intel Gaudi 3 OAM" / "Intel Gaudi 3 PCIe"
+# (the device table in internal/hw/pci.go) / "Intel Habana <device id>".
 pci_ids_name() {
 	dev=$(pci_device_id "$1")
+	ven=$(sed 's/^0x//' "$PCI_DEVICES/$1/vendor" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+	ven=${ven:-10de}
 	n=""
 	f=$(pci_ids_file)
 	if [ -n "$f" ]; then
-		n=$(awk -v id="$dev" '/^#/ || /^$/ {next}
-			/^[^\t]/ {nv = ($0 ~ /^10de /); next}
+		n=$(awk -v id="$dev" -v v="$ven" '/^#/ || /^$/ {next}
+			/^[^\t]/ {nv = (tolower(substr($0, 1, 4)) == v && substr($0, 5, 1) == " "); next}
 			nv && /^\t[^\t]/ && tolower(substr($0, 2, 4)) == id && substr($0, 6, 1) == " " {s = substr($0, 7); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); print s; exit}' "$f")
 	fi
-	printf '%s\n' "${n:-NVIDIA $dev}"
+	case "$ven" in
+		1da3)
+			case "$dev" in
+				1060) fb="Intel Gaudi 3 OAM" ;;
+				1063) fb="Intel Gaudi 3 PCIe" ;;
+				*) fb="Intel Habana $dev" ;;
+			esac ;;
+		*) fb="NVIDIA $dev" ;;
+	esac
+	printf '%s\n' "${n:-$fb}"
 }
 
 # smi_gpus: "bus id, name, memory MiB" per GPU from the host's NVIDIA driver,
@@ -331,11 +354,51 @@ gpu_processes() {
 	nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true
 }
 
+# hl_smi_gpus: "bus id, name, memory MiB" per Gaudi from the host's Habana driver,
+# empty without hl-smi (or while the driver has no device). The same query the agent
+# runs (cmd/runcrate-host/host.go habanaSMI); its format is not verified on a Gaudi
+# box yet (GAUDI-NOTES.md).
+hl_smi_gpus() {
+	command -v hl-smi >/dev/null 2>&1 || return 0
+	hl-smi --query-aip=bus_id,name,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+}
+
+# gaudi_processes: "pid name" of the processes holding a Gaudi device node open;
+# empty without fuser or device nodes. The nodes are not verified on a box.
+GAUDI_DEVS="/dev/accel/* /dev/hl*"
+gaudi_processes() {
+	command -v fuser >/dev/null 2>&1 || return 0
+	pids=""
+	# shellcheck disable=SC2086
+	for f in $GAUDI_DEVS; do
+		[ -e "$f" ] || continue
+		pids="$pids $(fuser "$f" 2>/dev/null || true)"
+	done
+	# shellcheck disable=SC2086
+	for p in $(printf '%s\n' $pids | sort -u); do
+		printf '%s %s\n' "$p" "$(ps -o comm= -p "$p" 2>/dev/null || true)"
+	done
+}
+
+# takes_vendor ADDRESSES: the install takes at least one of these GPUs (one address
+# per word): all of them without --gpus, else the ones --gpus lists.
+takes_vendor() {
+	[ -n "$1" ] || return 1
+	[ -n "$GPUS" ] || return 0
+	want=$(printf '%s' "$GPUS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+	# shellcheck disable=SC2086
+	for a in $1; do
+		case ",$want," in *",$a,"*) return 0 ;; esac
+	done
+	return 1
+}
+
 # The GPU models Runcrate sells. Mirrors gpuTypeFromName in Runcrate's web app
 # (src/lib/providers/gpu-names.ts), which decides at registration whether a
-# GPU is sold; NVIDIA models only, since hosts are NVIDIA. When that list
-# changes, change this one: `make check-models APP=<web app checkout>` runs
-# both on every NVIDIA name in pci.ids and fails when they disagree.
+# GPU is sold; NVIDIA models, and Intel Gaudi 3 (family gaudi3, below; the web
+# app's own list must name it too). When that list changes, change this one:
+# `make check-models APP=<web app checkout>` runs both on every NVIDIA name in
+# pci.ids and fails when they disagree.
 SOLD_MODELS="b200:B200 b300:B300 h200:H200 l40s:L40S l40:L40 l4:L4 a40:A40 a10:A10 a6000:A6000 a5000:A5000 a4000:A4000"
 # GeForce cards sold, by exact model number (a 4090 D or 5070 Ti is not).
 SOLD_RTX="5090:RTX5090 4090:RTX4090 3090:RTX3090"
@@ -354,6 +417,12 @@ gpu_model() {
 	[ "$gw" != " " ] || return 1
 	# A MIG slice is not a whole GPU.
 	has_word mig "$gw" && return 1
+	# Intel Gaudi 3: pci.ids "Gaudi3 [HL-325L]", the agent's "Intel Gaudi 3 OAM" and
+	# "Intel Gaudi 3 PCIe", hl-smi's "HL-325L" (OAM), "HL-328" and "HL-338" (the model
+	# numbers are from Intel's product pages, not verified on a box).
+	if has_word gaudi3 "$gw" || { has_word gaudi "$gw" && has_word 3 "$gw"; } || { has_word hl "$gw" && { has_word 325l "$gw" || has_word 328 "$gw" || has_word 338 "$gw"; }; }; then
+		echo Gaudi3; return 0
+	fi
 	if has_word rtx "$gw" && has_word pro "$gw" && has_word 6000 "$gw"; then
 		if has_word max "$gw" || has_word maxq "$gw"; then return 1; fi
 		echo RTXPro6000; return 0
@@ -417,7 +486,7 @@ gpu_companions() {
 	g=$(gpu_group "$1")
 	[ -n "$g" ] || return 0
 	for m in $(group_members "$g"); do
-		if [ "$m" != "$1" ] && [ "${m%.*}" = "${1%.*}" ] && [ "$(cat "$PCI_DEVICES/$m/vendor" 2>/dev/null)" = 0x10de ]; then
+		if [ "$m" != "$1" ] && [ "${m%.*}" = "${1%.*}" ] && [ "$(cat "$PCI_DEVICES/$m/vendor" 2>/dev/null)" = "$(cat "$PCI_DEVICES/$1/vendor" 2>/dev/null)" ]; then
 			printf '%s\n' "$m"
 		fi
 	done
@@ -425,7 +494,7 @@ gpu_companions() {
 
 # gpu_blocker ADDR: why the GPU can't be passed through, empty when it can. The
 # agent's rule (internal/hw/pci.go GPUs): besides bridges, its IOMMU group may
-# hold only other functions of the same NVIDIA card.
+# hold only other functions of the same card (same vendor, same slot).
 gpu_blocker() {
 	if acs_override; then
 		echo "the kernel runs with pcie_acs_override, so IOMMU groups don't prove isolation"; return 0
@@ -437,7 +506,7 @@ gpu_blocker() {
 		[ "$m" != "$1" ] && [ -r "$PCI_DEVICES/$m/vendor" ] || continue
 		class=$(cat "$PCI_DEVICES/$m/class" 2>/dev/null)
 		case "$class" in 0x0604*) continue ;; esac
-		if [ "$(cat "$PCI_DEVICES/$m/vendor")" != 0x10de ] || [ "${m%.*}" != "${1%.*}" ]; then
+		if [ "$(cat "$PCI_DEVICES/$m/vendor")" != "$(cat "$PCI_DEVICES/$1/vendor" 2>/dev/null)" ] || [ "${m%.*}" != "${1%.*}" ]; then
 			echo "IOMMU group $g also holds $m (class $class)"; return 0
 		fi
 	done
@@ -484,9 +553,10 @@ check_machine() {
 	fi
 	cpu_virt_on || die "CPU virtualization (VT-x / AMD-V) is off: turn it on in the BIOS"
 	gpus=$(nvidia_gpus)
-	[ -n "$gpus" ] || die "no NVIDIA GPU found"
+	ggpus=$(gaudi_gpus)
+	[ -n "$gpus$ggpus" ] || die "no NVIDIA GPU found"
 	say "GPUs:"
-	for a in $gpus; do say "  $a $(pci_ids_name "$a")"; done
+	for a in $gpus $ggpus; do say "  $a $(pci_ids_name "$a")"; done
 }
 
 # iommu_param: the kernel parameters this installer adds to turn IOMMU on.
@@ -645,24 +715,41 @@ install_agent() {
 	say "runcrate-host $("$BIN" version)"
 }
 
+# vfio_modprobe_conf: /etc/modprobe.d content that makes vfio-pci claim every
+# NVIDIA and Gaudi function (not bridges) at boot, before a host driver can. Its
+# `options vfio-pci ids=` does what `vfio-pci.ids=` on the kernel command line
+# does, with the NVIDIA ones the same way; habanalabs gets a softdep like nvidia
+# (only where there is a Gaudi, so an NVIDIA host's file stays what it was).
+vfio_modprobe_conf() {
+	ids=$({ lspci -nd 10de:; lspci -nd 1da3:; } | awk '$2 !~ /^0604/ {print $3}' | sort -u | paste -sd, -)
+	printf '# Written by the Runcrate host installer. Removed by --uninstall.\noptions vfio-pci ids=%s\nsoftdep nvidia pre: vfio-pci\nsoftdep nouveau pre: vfio-pci\nsoftdep snd_hda_intel pre: vfio-pci\nsoftdep xhci_pci pre: vfio-pci\n' "$ids"
+	if [ -n "$(gaudi_gpus)" ]; then printf 'softdep habanalabs pre: vfio-pci\n'; fi
+}
+
 take_gpus() {
 	step "Taking the GPUs off the host"
 	# (Registering reads names, memory and UUIDs from the host driver.)
-	busy=$(gpu_processes)
-	[ -z "$busy" ] || die "these processes are using the GPUs; stop them and run again:
+	if takes_vendor "$(nvidia_gpus)"; then
+		busy=$(gpu_processes)
+		[ -z "$busy" ] || die "these processes are using the GPUs; stop them and run again:
 $busy"
-	for u in nvidia-persistenced.service nvidia-fabricmanager.service; do
-		if systemctl is-enabled --quiet "$u" 2>/dev/null || systemctl is-active --quiet "$u" 2>/dev/null; then
-			systemctl disable --now "$u" >/dev/null 2>&1 || true
-			grep -qx "$u" "$DISABLED_UNITS" 2>/dev/null || echo "$u" >> "$DISABLED_UNITS"
-			say "Stopped $u (turned back on by --uninstall)."
-		fi
-	done
+		for u in nvidia-persistenced.service nvidia-fabricmanager.service; do
+			if systemctl is-enabled --quiet "$u" 2>/dev/null || systemctl is-active --quiet "$u" 2>/dev/null; then
+				systemctl disable --now "$u" >/dev/null 2>&1 || true
+				grep -qx "$u" "$DISABLED_UNITS" 2>/dev/null || echo "$u" >> "$DISABLED_UNITS"
+				say "Stopped $u (turned back on by --uninstall)."
+			fi
+		done
+	fi
+	if takes_vendor "$(gaudi_gpus)"; then
+		busy=$(gaudi_processes)
+		[ -z "$busy" ] || die "these processes are using the Gaudi accelerators; stop them and run again:
+$busy"
+	fi
 	if [ -z "$GPUS" ] && ! grep -q '"gpus"' "$CONF_DIR/config.json" 2>/dev/null; then
-		# Every NVIDIA function (not bridges) goes to vfio-pci at boot, before any
-		# host driver can take it.
-		ids=$(lspci -nd 10de: | awk '$2 !~ /^0604/ {print $3}' | sort -u | paste -sd, -)
-		conf=$(printf '# Written by the Runcrate host installer. Removed by --uninstall.\noptions vfio-pci ids=%s\nsoftdep nvidia pre: vfio-pci\nsoftdep nouveau pre: vfio-pci\nsoftdep snd_hda_intel pre: vfio-pci\nsoftdep xhci_pci pre: vfio-pci\n' "$ids")
+		# Every NVIDIA and Gaudi function (not bridges) goes to vfio-pci at boot,
+		# before any host driver can take it.
+		conf=$(vfio_modprobe_conf)
 		if [ "$(cat "$MODPROBE_CONF" 2>/dev/null)" != "$conf" ]; then
 			printf '%s\n' "$conf" > "$MODPROBE_CONF"
 			command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u >/dev/null 2>&1 || true
@@ -771,15 +858,63 @@ holds_other_files() {
 	return 1
 }
 
+# check_gaudi ADDR: one Gaudi accelerator's lines, as check_gpus gives an NVIDIA
+# GPU's (name, what Runcrate sells it as, IOMMU group, driver, what the install
+# does). Adds it to usable, or counts it in unusable.
+check_gaudi() {
+	a=$1
+	name=$(pci_ids_name "$a")
+	vram=""
+	row=$(printf '%s\n' "$hl" | awk -F', *' -v a="$a" 'length($1) >= 12 && tolower(substr($1, length($1) - 11)) == a {print; exit}')
+	if [ -n "$row" ]; then
+		name=$(printf '%s\n' "$row" | awk -F', *' '{print $2}')
+		vram=$(printf '%s\n' "$row" | awk -F', *' '{print int(($3 + 512) / 1024)}')
+	fi
+	model=$(gpu_model "$name" "$vram") || model=""
+	blocker=$(gpu_blocker "$a")
+	driver=$(pci_driver "$a")
+	group=$(gpu_group "$a")
+	with=$(gpu_companions "$a" | paste -sd, -)
+	ok=1
+	if [ -n "$model" ]; then sold="sold as $model"; else sold="not a model Runcrate sells"; ok=0; fi
+	case "$blocker" in
+		'') groupline="IOMMU group $group: only this accelerator${with:+ (with $with)}" ;;
+		"IOMMU is off") groupline="IOMMU group: none yet, the IOMMU is off (see IOMMU)" ;;
+		*) groupline="can't be passed through: $blocker"; ok=0 ;;
+	esac
+	if [ "$ok" -eq 1 ]; then
+		report PASS "GPU $a: $name, $sold"
+	elif [ -n "$blocker" ] && [ "$blocker" != "IOMMU is off" ]; then
+		case "$blocker" in
+			*pcie_acs_override*) fix="remove pcie_acs_override from the kernel command line" ;;
+			*) fix="turn on ACS for this slot in the BIOS or move the accelerator to another slot, or leave it out with --gpus" ;;
+		esac
+		report WARN "GPU $a: $name, $sold" "$fix"
+	else
+		report WARN "GPU $a: $name, $sold" "leave it out with --gpus (below); it stays with the host"
+	fi
+	detail "$groupline"
+	case "$driver" in
+		vfio-pci) detail "driver: vfio-pci, already set aside for passthrough" ;;
+		habanalabs) detail "driver: habanalabs; the install moves it to vfio-pci (no NVIDIA service is stopped for it)" ;;
+		none) detail "driver: none; the install binds it to vfio-pci" ;;
+		*) detail "driver: $driver; the install moves it to vfio-pci" ;;
+	esac
+	if [ "$ok" -eq 1 ]; then usable="${usable:+$usable,}$a"; else unusable=$((unusable + 1)); fi
+}
+
 check_gpus() {
 	gpus=$(nvidia_gpus)
-	if [ -z "$gpus" ]; then
+	ggpus=$(gaudi_gpus)
+	if [ -z "$gpus$ggpus" ]; then
 		report FAIL "NVIDIA GPUs: none found" "Runcrate rents out NVIDIA GPUs; this machine has none on its PCI bus" "no NVIDIA GPU"
 		return 0
 	fi
 	smi=$(smi_gpus)
 	usable=""
 	unusable=0
+	hl=""
+	[ -z "$ggpus" ] || hl=$(hl_smi_gpus)
 	for a in $gpus; do
 		name=$(pci_ids_name "$a")
 		vram=""
@@ -836,12 +971,15 @@ check_gpus() {
 		esac
 		if [ "$ok" -eq 1 ]; then usable="${usable:+$usable,}$a"; else unusable=$((unusable + 1)); fi
 	done
+	for a in $ggpus; do check_gaudi "$a"; done
 	if [ -z "$usable" ]; then
 		report FAIL "GPUs: none of them can be rented out" "see each GPU above" "no GPU Runcrate can rent out"
 	elif [ "$unusable" -gt 0 ]; then
 		report WARN "GPUs: $unusable can't be rented out" "install with --gpus $usable so the others stay with the host"
 	fi
 	busy=$(gpu_processes)
+	[ -z "$ggpus" ] || { gbusy=$(gaudi_processes); [ -z "$gbusy" ] || busy="${busy:+$busy
+}$gbusy"; }
 	if [ -n "$busy" ]; then
 		report WARN "Processes are using the GPUs: $(printf '%s\n' "$busy" | paste -sd ';' -)" "stop them before installing; the install refuses to start while they run"
 	fi

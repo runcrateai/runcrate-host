@@ -59,8 +59,9 @@ func (s Sysfs) Bind(addr string) error {
 		return fmt.Errorf("%s: driver_override: %w", addr, err)
 	}
 	if cur := s.driver(addr); cur != "" {
-		// Unbinding from the NVIDIA driver blocks while something holds the
-		// GPU (nvidia-persistenced, a display server, a CUDA process).
+		// Unbinding from the host driver (nvidia, habanalabs, ...) blocks while
+		// something holds the GPU (nvidia-persistenced, a display server, a
+		// CUDA process, a Gaudi runtime).
 		if err := write(s.dev(addr, "driver/unbind"), addr); err != nil {
 			return fmt.Errorf("%s: unbind from %s (is something using the GPU?): %w", addr, cur, err)
 		}
@@ -90,6 +91,9 @@ func (s Sysfs) Bind(addr string) error {
 // a VM. Add an ID only with a run like that behind it.
 var busResetIDs = map[string]bool{
 	"10de:2331": true,
+	// 1da3 (Intel Gaudi 3: 1da3:1060 OAM, 1da3:1063 PCIe): none yet. Fill from
+	// the box (reset_method), as above; until then Gaudi keeps the kernel's
+	// own reset methods, like any NVIDIA id not listed.
 }
 
 // busResetRefused says a bus reset is known to break the device: T4
@@ -169,8 +173,8 @@ func (s Sysfs) defaultReset(addr string) error {
 }
 
 // Release gives one function back to the host: its default reset methods,
-// clears the override and lets the kernel pick the normal driver (nvidia or
-// nouveau, if installed).
+// clears the override and lets the kernel pick the normal driver (nvidia,
+// nouveau or habanalabs, whichever is installed).
 func (s Sysfs) Release(addr string) error {
 	if !hw.ValidPCIAddress(addr) {
 		return fmt.Errorf("bad pci address %q", addr)
@@ -202,14 +206,18 @@ func (s Sysfs) Bound(addrs ...string) bool {
 }
 
 // ModprobeConf is /etc/modprobe.d content that makes vfio-pci claim the
-// given vendor:device ids at boot, before the NVIDIA driver loads. Used only
-// when Runcrate takes every NVIDIA GPU on the host.
+// given vendor:device ids at boot, before the NVIDIA driver (or, for Intel
+// Gaudi ids, 1da3:..., habanalabs) loads. Used only when Runcrate takes every
+// GPU on the host.
 func ModprobeConf(ids []string) string {
 	var b strings.Builder
 	b.WriteString("# Written by runcrate-host. Removed by `runcrate-host uninstall`.\n")
 	fmt.Fprintf(&b, "options vfio-pci ids=%s disable_vga=1\n", strings.Join(ids, ","))
 	for _, m := range []string{"nvidia", "nvidia_drm", "nvidia_modeset", "nouveau", "snd_hda_intel", "xhci_pci"} {
 		fmt.Fprintf(&b, "softdep %s pre: vfio-pci\n", m)
+	}
+	if slices.ContainsFunc(ids, func(id string) bool { return strings.HasPrefix(id, "1da3:") }) {
+		b.WriteString("softdep habanalabs pre: vfio-pci\n")
 	}
 	return b.String()
 }

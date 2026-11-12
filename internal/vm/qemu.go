@@ -48,6 +48,11 @@ type QemuSpec struct {
 	PassThrough []string
 	// MMIO64MB is the 64-bit MMIO window: big enough for every BAR.
 	MMIO64MB int
+	// KernelArgs are extra guest kernel arguments (Intel Gaudi VMs). The guest
+	// boots from its own disk, so they are passed as an SMBIOS OEM string,
+	// runcrate.kernel_args=..., that the image puts on its kernel command line
+	// on first boot (image/build.sh). "" for NVIDIA: nothing is added.
+	KernelArgs string
 }
 
 // Args is the qemu-system-x86_64 command line.
@@ -82,6 +87,10 @@ func (s QemuSpec) Args() []string {
 		"-chardev", "ringbuf,id=serial0,size=1048576",
 		"-serial", "chardev:serial0",
 		"-qmp", "unix:" + filepath.Join(s.Dir, "qmp.sock") + ",server=on,wait=off",
+	}
+	if s.KernelArgs != "" {
+		// A comma in a QEMU option value is written twice.
+		a = append(a, "-smbios", "type=11,value=runcrate.kernel_args="+strings.ReplaceAll(s.KernelArgs, ",", ",,"))
 	}
 	for i, addr := range s.PassThrough {
 		rp := fmt.Sprintf("rp%d", i)

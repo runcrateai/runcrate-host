@@ -106,6 +106,15 @@ model_is "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition" "" -
 model_is "GB100 [B200]" "" B200
 model_is "GK208B [GeForce GT 710]" "" -
 model_is "NVIDIA 2330" "" -
+# Intel Gaudi 3 is sold (family gaudi3) under every name the agent or hl-smi gives it; other Habana cards are not.
+model_is "Gaudi3 [HL-325L]" "" Gaudi3
+model_is "Intel Gaudi 3 OAM" "" Gaudi3
+model_is "Intel Gaudi 3 PCIe" "" Gaudi3
+model_is "HL-325L" 128 Gaudi3
+model_is "HL-338" "" Gaudi3
+model_is "Intel Gaudi 2" "" -
+model_is "Intel Habana 1ffe" "" -
+model_is "Gaudi" "" -
 
 # 7. --check on a fake machine. Each case runs in a subshell that sources the
 #    installer again (say is real there) and points every read at the fake tree.
@@ -236,6 +245,57 @@ out=$(run_case)
 has "model not identified: no pci.ids found and no NVIDIA driver" "no pci.ids"
 has "install pciutils" "no pci.ids"
 
+# 7i. Gaudi: two OAM modules on habanalabs, each alone in its IOMMU group (a bridge shares one): ready.
+new_machine
+printf '1da3  Habana Labs Ltd.\n\t1060  Gaudi3 [HL-325L]\n' >> "$M/pci.ids"
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+dev 0000:18:01.0 0x8086 0x1234 0x060400 pcieport 1
+dev 0000:3b:00.0 0x1da3 0x1060 0x120000 habanalabs 2
+out=$(run_case)
+has "PASS  GPU 0000:19:00.0: Gaudi3 [HL-325L], sold as Gaudi3" "gaudi ready"
+has "PASS  GPU 0000:3b:00.0: Gaudi3 [HL-325L], sold as Gaudi3" "gaudi ready"
+has "IOMMU group 1: only this accelerator" "gaudi ready"
+has "driver: habanalabs; the install moves it to vfio-pci (no NVIDIA service is stopped for it)" "gaudi ready"
+hasnt "nvidia-persistenced" "gaudi ready"
+hasnt "WARN" "gaudi ready"
+has "Verdict: READY." "gaudi ready"
+has "exit=0" "gaudi ready"
+# Without pci.ids the agent's own name is used; with hl-smi (header line and a longer bus id included) its name is.
+rm -f "$M/pci.ids"
+out=$(run_case)
+has "PASS  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi without pci.ids"
+printf '#!/bin/sh\necho "bus_id, name, memory.total"\necho "00000000:19:00.0, HL-325L, 131072"\n' > "$T/bin/hl-smi"
+chmod +x "$T/bin/hl-smi"
+out=$(run_case)
+has "PASS  GPU 0000:19:00.0: HL-325L, sold as Gaudi3" "gaudi with hl-smi"
+has "PASS  GPU 0000:3b:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi without an hl-smi row"
+rm -f "$T/bin/hl-smi"
+
+# 7j. Gaudi: a module sharing its group with a NIC, one Runcrate doesn't sell, one with no driver.
+new_machine
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+dev 0000:1a:00.0 0x15b3 0x1021 0x020000 mlx5_core 1
+dev 0000:3b:00.0 0x1da3 0x1060 0x120000 habanalabs 2
+dev 0000:5c:00.0 0x1da3 0x1ffe 0x120000 "" 3
+out=$(run_case)
+has "WARN  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi shared group"
+has "can't be passed through: IOMMU group 1 also holds 0000:1a:00.0 (class 0x020000)" "gaudi shared group"
+has "PASS  GPU 0000:3b:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi shared group"
+has "WARN  GPU 0000:5c:00.0: Intel Habana 1ffe, not a model Runcrate sells" "gaudi unsold"
+has "driver: none; the install binds it to vfio-pci" "gaudi no driver"
+has "install with --gpus 0000:3b:00.0 so the others stay with the host" "gaudi shared group"
+has "exit=0" "gaudi shared group"
+
+# 7k. NVIDIA and Gaudi on one host: every card reported, each by its own rules.
+new_machine
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+out=$(run_case)
+has "PASS  GPU 0000:41:00.0: GH100 [H100 SXM5 80GB], sold as H100" "mixed host"
+has "PASS  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "mixed host"
+has "driver: nvidia; the install moves it to vfio-pci (stopping nvidia-persistenced" "mixed host"
+has "Verdict: READY." "mixed host"
+
 # 8. check_machine, the install's own checks, on the same fake machines.
 # check_case: check_machine against the fake machine; its output and "exit=N".
 check_case() {
@@ -266,6 +326,54 @@ printf 'vendor_id : GenuineIntel\nflags : fpu sse\n' > "$M/cpuinfo"
 dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
 out=$(check_case)
 has "Error: CPU virtualization (VT-x / AMD-V) is off" "check_machine no vmx"
+new_machine
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+out=$(check_case)
+has "  0000:19:00.0 Intel Gaudi 3 OAM" "check_machine gaudi"
+has "exit=0" "check_machine gaudi"
+
+# 8b. The boot-time vfio-pci file: an NVIDIA host's stays what it was; a Gaudi adds its ids and the habanalabs softdep.
+printf '#!/bin/sh\ncase "$2" in\n10de:) [ -r "${LSPCI_NV:-/nonexistent}" ] && cat "$LSPCI_NV" ;;\n1da3:) [ -r "${LSPCI_HL:-/nonexistent}" ] && cat "$LSPCI_HL" ;;\nesac\nexit 0\n' > "$T/bin/lspci"
+chmod +x "$T/bin/lspci"
+printf '41:00.0 0302: 10de:2330 (rev a1)\n41:00.1 0403: 10de:22ba (rev a1)\n40:01.0 0604: 10de:1234\n' > "$T/lspci-nv"
+printf '19:00.0 1200: 1da3:1060 (rev 01)\n3b:00.0 1200: 1da3:1060 (rev 01)\n' > "$T/lspci-hl"
+# conf_of NVIDIA_LSPCI_FILE HABANA_LSPCI_FILE: vfio_modprobe_conf on the fake machine.
+conf_of() { (. "$REPO/install.sh"; PCI_DEVICES="$M/devices"; LSPCI_NV=$1; LSPCI_HL=$2; export LSPCI_NV LSPCI_HL; vfio_modprobe_conf); }
+nv_conf='# Written by the Runcrate host installer. Removed by --uninstall.
+options vfio-pci ids=10de:22ba,10de:2330
+softdep nvidia pre: vfio-pci
+softdep nouveau pre: vfio-pci
+softdep snd_hda_intel pre: vfio-pci
+softdep xhci_pci pre: vfio-pci'
+new_machine
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+got=$(conf_of "$T/lspci-nv" "")
+[ "$got" = "$nv_conf" ] || { printf '%s\n' "$got" >&2; fail "an NVIDIA host's modprobe file changed"; }
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+got=$(conf_of "$T/lspci-nv" "$T/lspci-hl")
+printf '%s\n' "$got" | grep -qx 'options vfio-pci ids=10de:22ba,10de:2330,1da3:1060' || { printf '%s\n' "$got" >&2; fail "mixed host: ids"; }
+[ "$(printf '%s\n' "$got" | tail -n 1)" = "softdep habanalabs pre: vfio-pci" ] || fail "mixed host: no habanalabs softdep"
+printf '%s\n' "$got" | grep -qx 'softdep nvidia pre: vfio-pci' || fail "mixed host: no nvidia softdep"
+got=$(conf_of "" "$T/lspci-hl")
+printf '%s\n' "$got" | grep -qx 'options vfio-pci ids=1da3:1060' || { printf '%s\n' "$got" >&2; fail "gaudi host: ids"; }
+printf '%s\n' "$got" | grep -qx 'softdep habanalabs pre: vfio-pci' || fail "gaudi host: no habanalabs softdep"
+rm -f "$T/bin/lspci"
+
+# 8c. The install takes a vendor's GPUs when it takes all of them or --gpus names one; a Gaudi's open device nodes are found.
+# tv GPUS ADDRESSES: takes_vendor with --gpus GPUS.
+tv() { if (. "$REPO/install.sh"; GPUS=$1; takes_vendor "$2"); then echo yes; else echo no; fi; }
+[ "$(tv "" "0000:19:00.0")" = yes ] || fail "takes_vendor: all GPUs by default"
+[ "$(tv "" "")" = no ] || fail "takes_vendor: no GPUs of that vendor"
+[ "$(tv "0000:41:00.0" "0000:19:00.0")" = no ] || fail "takes_vendor: --gpus names only the other vendor"
+[ "$(tv "0000:41:00.0,0000:19:00.0" "0000:3b:00.0 0000:19:00.0")" = yes ] || fail "takes_vendor: --gpus names one of them"
+mkdir -p "$T/accel"; : > "$T/accel/accel0"
+printf '#!/bin/sh\necho " 1"\n' > "$T/bin/fuser"
+chmod +x "$T/bin/fuser"
+got=$(. "$REPO/install.sh"; GAUDI_DEVS="$T/accel/*"; gaudi_processes)
+[ "$got" = "1 $(ps -o comm= -p 1)" ] || fail "gaudi_processes = '$got'"
+got=$(. "$REPO/install.sh"; GAUDI_DEVS="$T/none/*"; gaudi_processes)
+[ -z "$got" ] || fail "gaudi_processes without device nodes = '$got'"
+rm -f "$T/bin/fuser"
 
 # 9. Options that take a value refuse a missing one, or the next option in its place.
 for args in "--name --check" "--gpus" "--data-dir -y" "--token-file --check"; do

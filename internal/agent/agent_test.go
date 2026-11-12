@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 	"github.com/runcrateai/runcrate-host/internal/vm"
 )
 
@@ -119,6 +120,8 @@ type fakeVMs struct {
 	free       []int // FreeGPUs' answer when set
 	cleared    []int
 	held       map[int]bool
+	vendors    map[int]hw.Vendor       // GPUVendor's answer by index (none: no vendor recorded)
+	ephOutFor  func(gpus []int) []byte // a throwaway VM's output by its GPUs, when set
 }
 
 func newFakeVMs() *fakeVMs {
@@ -177,6 +180,12 @@ func (v *fakeVMs) FreeGPUs(bool) []int {
 	return []int{0, 1}
 }
 
+func (v *fakeVMs) GPUVendor(i int) hw.Vendor {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.vendors[i]
+}
+
 func (v *fakeVMs) HeldGPUs() map[int]bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -204,6 +213,9 @@ func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner, image string, gpu
 	v.ephScript = append(v.ephScript, script)
 	v.ephGPUs = append(v.ephGPUs, append([]int{}, gpus...))
 	out, err := v.ephOut, v.ephErr
+	if v.ephOutFor != nil {
+		out = v.ephOutFor(gpus)
+	}
 	v.mu.Unlock()
 	if during != nil {
 		during(ctx, "10.254.0.2")
@@ -643,5 +655,63 @@ func TestBenchmarkLeavesOutGPUsTakenDuringTheDownload(t *testing.T) {
 				t.Fatalf("held %v cleared %v: gpu 1 belongs to the create", vms.held, vms.cleared)
 			}
 		})
+	}
+}
+
+// An NVIDIA-only host boots one benchmark VM, with the NVIDIA script and the
+// id it always had.
+func TestBenchmarkNvidiaOnlyHostIsUnchanged(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorNvidia, 1: hw.VendorNvidia}
+	vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true},{"ordinal":1,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(45, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(45)) > 0 })
+	if len(vms.ephemeral) != 1 || vms.ephemeral[0] != "bench-45" || len(vms.ephGPUs[0]) != 2 {
+		t.Fatalf("throwaway vms %v on gpus %v, want one, bench-45, on both", vms.ephemeral, vms.ephGPUs)
+	}
+	if want := vm.BenchScript(vm.IsolationTargets{}); vms.ephScript[0] != want {
+		t.Fatalf("the NVIDIA benchmark script changed:\n%s", vms.ephScript[0])
+	}
+}
+
+// NVIDIA and Gaudi on one host: one benchmark VM per vendor, NVIDIA first and
+// alone with the isolation checks; every GPU is reported.
+func TestBenchmarkMixedHostBootsOneVMPerVendor(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.free = []int{0, 1, 2}
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorHabana, 1: hw.VendorNvidia, 2: hw.VendorNvidia}
+	vms.ephOutFor = func(gpus []int) []byte {
+		if len(gpus) == 1 {
+			return []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"Intel Gaudi 3 OAM","uuid":"","mem_ok":true,"matmul_ok":true}],"isolation":[{"name":"must-not-appear","ok":true,"detail":""}]}`)
+		}
+		return []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true},{"ordinal":1,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}],"isolation":[{"name":"egress","ok":true,"detail":"works"}]}`)
+	}
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(46, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(46)) > 0 })
+	if len(vms.ephemeral) != 2 || vms.ephemeral[0] != "bench-46" || vms.ephemeral[1] != "bench-46-intel-habana" {
+		t.Fatalf("throwaway vms = %v", vms.ephemeral)
+	}
+	if len(vms.ephGPUs[0]) != 2 || vms.ephGPUs[0][0] != 1 || vms.ephGPUs[0][1] != 2 || len(vms.ephGPUs[1]) != 1 || vms.ephGPUs[1][0] != 0 {
+		t.Fatalf("gpus per vm = %v, want [[1 2] [0]]", vms.ephGPUs)
+	}
+	if !strings.Contains(vms.ephScript[0], "nvidia-smi") || !strings.Contains(vms.ephScript[0], "must egress") {
+		t.Fatal("the first VM must run the NVIDIA script with the isolation checks")
+	}
+	if !strings.Contains(vms.ephScript[1], "gaudi_pci") || strings.Contains(vms.ephScript[1], "must egress") || strings.Contains(vms.ephScript[1], "nvidia-smi -L") {
+		t.Fatal("the second VM must run the Gaudi script without the isolation checks")
+	}
+	b := cp.benchmarks[0]
+	if len(b.GPUs) != 3 || b.GPUs[0].Index != 0 || b.GPUs[0].Name != "Intel Gaudi 3 OAM" || b.GPUs[1].UUID != "GPU-a" || b.GPUs[2].UUID != "GPU-b" {
+		t.Fatalf("gpus = %+v", b.GPUs)
+	}
+	if b.Isolation == nil || len(b.Isolation.Checks) != 1 || b.Isolation.Checks[0].Name != "egress" {
+		t.Fatalf("isolation = %+v, want only the first VM's checks", b.Isolation)
+	}
+	if len(vms.cleared) != 3 || len(vms.held) != 0 {
+		t.Fatalf("cleared %v held %v", vms.cleared, vms.held)
 	}
 }

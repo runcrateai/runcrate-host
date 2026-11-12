@@ -1,6 +1,6 @@
-// Package hw reads the host's hardware from sysfs: NVIDIA GPUs and their
-// IOMMU groups, NVSwitches, NICs, CPU, memory and disk. Every reader takes a
-// root so tests can point it at a fake sysfs tree.
+// Package hw reads the host's hardware from sysfs: GPUs (NVIDIA, Intel Gaudi)
+// and their IOMMU groups, NVSwitches, NICs, CPU, memory and disk. Every reader
+// takes a root so tests can point it at a fake sysfs tree.
 package hw
 
 import (
@@ -14,8 +14,79 @@ import (
 	"strings"
 )
 
+// Vendor is a GPU maker whose devices Runcrate passes through.
+type Vendor string
+
+const (
+	VendorNvidia Vendor = "nvidia"
+	VendorHabana Vendor = "intel-habana"
+)
+
 // NvidiaVendor is the PCI vendor id of NVIDIA.
 const NvidiaVendor = "0x10de"
+
+// HabanaVendor is the PCI vendor id of Habana Labs (Intel Gaudi).
+const HabanaVendor = "0x1da3"
+
+// deviceInfo is what we know of one device id of a GPU vendor.
+type deviceInfo struct {
+	Family string // product family, "gaudi3"
+	Name   string // name when pci.ids has none
+	VRAMGB int    // fallback memory size, used only when no host tool reports it
+}
+
+// gpuVendor is one GPU maker: its PCI vendor id (sysfs form), the PCI class
+// prefixes its GPUs carry and the device ids we know of.
+type gpuVendor struct {
+	Vendor  Vendor
+	PCIID   string
+	Classes []string
+	// Label starts a device's name when neither pci.ids nor Devices has one.
+	Label string
+	// Devices is keyed by device id without 0x. Add a card by adding a row.
+	Devices map[string]deviceInfo
+}
+
+// gpuVendors is every vendor whose devices count as GPUs. NVIDIA GPUs are
+// display (0x0300) or 3D (0x0302) controllers. Gaudi's class is expected to be
+// a processing accelerator (0x12xx) but isn't verified on a box (GAUDI-NOTES.md),
+// so any Habana function in 0x12xx or 0x03xx counts.
+var gpuVendors = []gpuVendor{
+	{
+		Vendor:  VendorNvidia,
+		PCIID:   NvidiaVendor,
+		Classes: []string{"0x0300", "0x0302"},
+		Label:   "NVIDIA",
+	},
+	{
+		Vendor:  VendorHabana,
+		PCIID:   HabanaVendor,
+		Classes: []string{"0x12", "0x03"},
+		Label:   "Intel Habana",
+		Devices: map[string]deviceInfo{
+			// Gaudi 3 has 128 GB of HBM2e per accelerator (docs.habana.ai).
+			"1060": {Family: "gaudi3", Name: "Intel Gaudi 3 OAM", VRAMGB: 128},
+			"1063": {Family: "gaudi3", Name: "Intel Gaudi 3 PCIe", VRAMGB: 128},
+		},
+	},
+}
+
+// vendorOf finds the GPU vendor with the given sysfs vendor id (0x10de).
+func vendorOf(pciID string) (gpuVendor, bool) {
+	for _, v := range gpuVendors {
+		if v.PCIID == pciID {
+			return v, true
+		}
+	}
+	return gpuVendor{}, false
+}
+
+// IsGPUVendor reports whether pciID (a sysfs vendor id like 0x10de) belongs to
+// a vendor whose GPUs Runcrate passes through.
+func IsGPUVendor(pciID string) bool {
+	_, ok := vendorOf(pciID)
+	return ok
+}
 
 // Sys is a sysfs/procfs root ("/" in production).
 type Sys struct{ Root string }
@@ -93,9 +164,25 @@ func (s Sys) Devices() ([]PCIDevice, error) {
 	return out, nil
 }
 
-// IsGPU reports whether the function is an NVIDIA display or 3D controller.
+// IsGPU reports whether the function is a GPU of a vendor in gpuVendors: an
+// NVIDIA display or 3D controller, or an Intel Gaudi accelerator.
 func (d PCIDevice) IsGPU() bool {
-	return d.Vendor == NvidiaVendor && (strings.HasPrefix(d.Class, "0x0300") || strings.HasPrefix(d.Class, "0x0302"))
+	_, ok := d.gpu()
+	return ok
+}
+
+// gpu returns the vendor of a GPU function.
+func (d PCIDevice) gpu() (gpuVendor, bool) {
+	v, ok := vendorOf(d.Vendor)
+	if !ok {
+		return gpuVendor{}, false
+	}
+	for _, c := range v.Classes {
+		if strings.HasPrefix(d.Class, c) {
+			return v, true
+		}
+	}
+	return gpuVendor{}, false
 }
 
 // IsNVSwitch reports whether the function is an NVIDIA NVSwitch (bridge, other).
@@ -133,7 +220,7 @@ func (s Sys) IOMMUEnabled() bool {
 	return err == nil && len(ents) > 0
 }
 
-// GPU is one NVIDIA GPU on the host, with what must go to vfio-pci with it.
+// GPU is one GPU (NVIDIA or Intel Gaudi) on the host, with what must go to vfio-pci with it.
 type GPU struct {
 	Index      int
 	Address    string
@@ -148,9 +235,17 @@ type GPU struct {
 	Companions []string
 	// Blocker explains why the GPU can't be passed through ("" when it can).
 	Blocker string
+	// Vendor is who made the GPU.
+	Vendor Vendor
+	// Family is the product family from our device table ("gaudi3"); "" when
+	// the table doesn't know the device, always for NVIDIA.
+	Family string
+	// VRAMFallback marks a VRAMGB taken from our device table because no host
+	// tool reported it.
+	VRAMFallback bool
 }
 
-// Cached is what the host's NVIDIA driver said about a GPU before the
+// Cached is what the host's vendor tool (nvidia-smi, hl-smi) said about a GPU before the
 // installer took it (the driver is gone once the GPU is on vfio-pci).
 type Cached struct {
 	Name   string `json:"name"`
@@ -158,7 +253,7 @@ type Cached struct {
 	UUID   string `json:"uuid"`
 }
 
-// GPUs lists NVIDIA GPUs sorted by address and numbered in that order. only,
+// GPUs lists NVIDIA and Intel Gaudi GPUs sorted by address and numbered in that order. only,
 // when non-empty, restricts the list to those addresses. cache supplies
 // name, VRAM and UUID by address.
 func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, error) {
@@ -179,13 +274,20 @@ func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, e
 		if !d.IsGPU() || (len(want) > 0 && !want[d.Address]) {
 			continue
 		}
-		g := GPU{Index: len(out), Address: d.Address, DeviceID: d.Device, Driver: d.Driver, IOMMUGroup: d.IOMMUGroup}
+		gv, _ := d.gpu()
+		g := GPU{Index: len(out), Address: d.Address, DeviceID: d.Device, Driver: d.Driver, IOMMUGroup: d.IOMMUGroup, Vendor: gv.Vendor}
 		g.ModelRaw = ids.Name(d.Vendor, d.Device)
 		if c, ok := cache[d.Address]; ok {
 			if c.Name != "" {
 				g.ModelRaw = c.Name
 			}
 			g.VRAMGB, g.UUID = c.VRAMGB, c.UUID
+		}
+		if di, ok := gv.Devices[strings.TrimPrefix(strings.ToLower(d.Device), "0x")]; ok {
+			g.Family = di.Family
+			if g.VRAMGB == 0 {
+				g.VRAMGB, g.VRAMFallback = di.VRAMGB, di.VRAMGB > 0
+			}
 		}
 		switch members, err := s.GroupMembers(d.IOMMUGroup); {
 		case s.acsOverride():
@@ -203,7 +305,7 @@ func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, e
 				if !ok || md.isBridge() {
 					continue
 				}
-				if md.Vendor != NvidiaVendor || md.Slot() != d.Slot() {
+				if md.Vendor != d.Vendor || md.Slot() != d.Slot() {
 					g.Blocker = fmt.Sprintf("IOMMU group %s also holds %s (%s); turn on ACS or move the card", d.IOMMUGroup, m, md.Class)
 					continue
 				}
@@ -235,7 +337,8 @@ func (s Sys) NVSwitches() ([]PCIDevice, error) {
 	return out, nil
 }
 
-// PCIIDs is a parsed pci.ids database (vendor 10de only, which is all we need).
+// PCIIDs is a parsed pci.ids database (the vendors in gpuVendors, which is all
+// we need), keyed by "vendor:device" without 0x.
 type PCIIDs struct{ names map[string]string }
 
 // LoadPCIIDs reads the first pci.ids found. A missing database is fine:
@@ -250,22 +353,27 @@ func LoadPCIIDs(paths ...string) *PCIIDs {
 		defer f.Close()
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 1<<16), 1<<20)
-		in := false
+		vendor := ""
 		for sc.Scan() {
 			line := sc.Text()
 			if line == "" || line[0] == '#' {
 				continue
 			}
 			if line[0] != '\t' {
-				in = strings.HasPrefix(line, "10de ")
+				vendor = ""
+				if len(line) > 5 && line[4] == ' ' {
+					if id := strings.ToLower(line[:4]); IsGPUVendor("0x" + id) {
+						vendor = id
+					}
+				}
 				continue
 			}
-			if !in || strings.HasPrefix(line, "\t\t") {
+			if vendor == "" || strings.HasPrefix(line, "\t\t") {
 				continue
 			}
 			l := strings.TrimPrefix(line, "\t")
 			if len(l) > 6 && l[4] == ' ' {
-				ids.names[strings.ToLower(l[:4])] = strings.TrimSpace(l[5:])
+				ids.names[vendor+":"+strings.ToLower(l[:4])] = strings.TrimSpace(l[5:])
 			}
 		}
 		return ids
@@ -273,15 +381,24 @@ func LoadPCIIDs(paths ...string) *PCIIDs {
 	return ids
 }
 
-// Name returns the pci.ids name for a device, or "NVIDIA <id>".
+// Name returns the pci.ids name for a device, else our device table's, else
+// the vendor's label and the device id ("NVIDIA <id>").
 func (ids *PCIIDs) Name(vendor, device string) string {
+	v := strings.TrimPrefix(strings.ToLower(vendor), "0x")
 	dev := strings.TrimPrefix(strings.ToLower(device), "0x")
 	if ids != nil {
-		if n, ok := ids.names[dev]; ok {
+		if n, ok := ids.names[v+":"+dev]; ok {
 			return n
 		}
 	}
-	return "NVIDIA " + dev
+	gv, ok := vendorOf("0x" + v)
+	if !ok {
+		return "PCI " + v + ":" + dev
+	}
+	if di, ok := gv.Devices[dev]; ok {
+		return di.Name
+	}
+	return gv.Label + " " + dev
 }
 
 // DefaultPCIIDsPaths are where Debian and Ubuntu keep pci.ids.

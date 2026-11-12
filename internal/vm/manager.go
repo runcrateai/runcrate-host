@@ -441,6 +441,20 @@ func (m *Manager) gpu(idx int) (hw.GPU, bool) {
 	return hw.GPU{}, false
 }
 
+// vendorOf is the vendor of the GPUs of a VM ("" when none is known): claim
+// keeps one VM to one vendor.
+func (m *Manager) vendorOf(gpus []int) hw.Vendor {
+	for _, g := range gpus {
+		if gpu, ok := m.gpu(g); ok {
+			return gpu.Vendor
+		}
+	}
+	return ""
+}
+
+// GPUVendor is the vendor of one registered GPU ("" when the index is unknown).
+func (m *Manager) GPUVendor(idx int) hw.Vendor { return m.vendorOf([]int{idx}) }
+
 // ErrCapacity means the host can't fit the VM.
 var ErrCapacity = errors.New("not enough capacity on this host")
 
@@ -454,6 +468,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		return nil, false, fmt.Errorf("vcpus and ram_gb must be positive")
 	}
 	seen := map[int]bool{}
+	var vendor hw.Vendor
 	for _, g := range s.GPUIndexes {
 		gpu, ok := m.gpu(g)
 		if !ok {
@@ -465,6 +480,10 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		if seen[g] {
 			return nil, false, fmt.Errorf("gpu index %d listed twice", g)
 		}
+		if len(seen) > 0 && gpu.Vendor != vendor {
+			return nil, false, fmt.Errorf("gpu %d is %q but the VM's other GPUs are %q: one VM takes GPUs of one vendor", g, gpu.Vendor, vendor)
+		}
+		vendor = gpu.Vendor
 		seen[g] = true
 	}
 	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != len(m.GPUs) {
@@ -715,6 +734,7 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 		Tap: r.Tap, MAC: r.MAC, Firmware: m.Firmware, PassThrough: r.PassThrough,
 		MMIO64MB: MMIO64For(m.Sys.Root, r.PassThrough),
 	}
+	spec.ForVendor(m.vendorOf(r.GPUIndexes))
 	if filepath.Dir(spec.Base) != filepath.Join(m.DataDir, "images") {
 		return fmt.Errorf("vm %s has no valid base image (%q)", r.ID, spec.Base)
 	}
@@ -1034,6 +1054,9 @@ func (m *Manager) startScrub(id string, gpus []int) {
 // benchmark.
 func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 	owner := "scrub:" + after
+	if m.vendorOf(gpus) == hw.VendorHabana {
+		m.Log.Warn("gaudi scrub only checks the accelerators reached the VM: their memory is not overwritten", "after", after, "gpus", gpus)
+	}
 	m.Hold(gpus)
 	m.mu.Lock()
 	for _, g := range gpus {
@@ -1053,7 +1076,7 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		id := fmt.Sprintf("scrub-%s-%d", hex.EncodeToString(hash(after))[:10], time.Now().UnixNano()%1e9)
 		rctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		var out []byte
-		out, _, err = m.RunEphemeral(rctx, id, owner, "", gpus, ScrubScript, 15*time.Minute, nil)
+		out, _, err = m.RunEphemeral(rctx, id, owner, "", gpus, ScrubScriptFor(m.vendorOf(gpus)), 15*time.Minute, nil)
 		cancel()
 		if ctx.Err() != nil {
 			return // shutting down: marker kept
