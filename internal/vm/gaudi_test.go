@@ -164,20 +164,22 @@ func TestMixedHostVMs(t *testing.T) {
 	}
 }
 
-// After a Gaudi VM, the scrub VM runs the Gaudi script and its result frees the GPU.
-func TestGaudiScrubRunsTheGaudiScript(t *testing.T) {
+// scrubOutcome runs a VM on GPU idx (made a v GPU), destroys it, lets its scrub
+// VM post body, and returns what creating a new VM on that GPU says, the held
+// GPUs and the script the scrub VM ran.
+func scrubOutcome(t *testing.T, idx int, v hw.Vendor, body string) (createErr error, held map[int]bool, script string) {
+	t.Helper()
 	f := newFixture(t)
-	f.m.GPUs[1].Vendor = hw.VendorHabana
+	f.m.GPUs[idx].Vendor = v
 	f.m.Scrub = true
-	f.answerEphemeral(`{"ok":true,"wiped":false,"gpus":[{"uuid":"","ok":true}]}`)
+	f.answerEphemeral(body)
 	var mu sync.Mutex
-	var scrubScript string
 	inner := f.host.onStart
 	f.host.onStart = func(id string) {
 		f.m.mu.Lock()
 		if r, ok := f.m.vms[id]; ok && strings.HasPrefix(id, "scrub-") {
 			mu.Lock()
-			scrubScript = r.CloudInit
+			script = r.CloudInit
 			mu.Unlock()
 		}
 		f.m.mu.Unlock()
@@ -187,23 +189,121 @@ func TestGaudiScrubRunsTheGaudiScript(t *testing.T) {
 		f.prepTap(t, id)
 	}
 	ctx := context.Background()
-	if _, err := f.m.Create(ctx, spec("vm-a", 1)); err != nil {
+	if _, err := f.m.Create(ctx, spec("vm-a", idx)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.m.Destroy(ctx, "vm-a"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Create(ctx, spec("vm-b", 1)); err != nil {
-		t.Fatal(err)
-	}
+	_, createErr = f.m.Create(ctx, spec("vm-b", idx))
 	f.m.Wait()
 	mu.Lock()
 	defer mu.Unlock()
-	if scrubScript != GaudiScrubScript {
-		t.Fatalf("the scrub VM ran:\n%s", scrubScript)
+	held = map[int]bool{}
+	for g, ok := range f.m.HeldGPUs() {
+		held[g] = ok
 	}
-	if started := f.host.startedIDs(); len(started) != 3 || !strings.HasPrefix(started[1], "scrub-") || started[2] != "vm-b" {
-		t.Fatalf("start order = %v, want vm-a, a scrub, then vm-b", started)
+	return createErr, held, script
+}
+
+// A Gaudi scrub can't overwrite HBM: its "wiped": false, or a result that
+// doesn't say it wiped, keeps the module held back and refuses a new VM.
+func TestGaudiScrubFailsTheHold(t *testing.T) {
+	for name, body := range map[string]string{
+		"wiped false":   `{"ok":true,"wiped":false,"gpus":[{"uuid":"","ok":true}]}`,
+		"wiped omitted": `{"ok":true,"gpus":[{"uuid":"","ok":true}]}`,
+		"wiped null":    `{"ok":true,"wiped":null,"gpus":[{"uuid":"","ok":true}]}`,
+	} {
+		err, held, script := scrubOutcome(t, 1, hw.VendorHabana, body)
+		if err == nil || !strings.Contains(err.Error(), "held back after a failed memory scrub") {
+			t.Errorf("%s: creating a VM on the scrubbed Gaudi: %v", name, err)
+		}
+		if !held[1] || len(held) != 1 {
+			t.Errorf("%s: held = %v, want the Gaudi module only", name, held)
+		}
+		if script != GaudiScrubScript {
+			t.Errorf("%s: the scrub VM ran:\n%s", name, script)
+		}
+	}
+}
+
+// The script the Gaudi scrub VM really runs posts "wiped": false.
+func TestGaudiScrubScriptSaysNotWiped(t *testing.T) {
+	if !strings.Contains(GaudiScrubScript, `"wiped": False`) || strings.Contains(GaudiScrubScript, `"wiped": True`) {
+		t.Fatal("the Gaudi scrub script must report wiped: false")
+	}
+}
+
+// NVIDIA results that leave "wiped" out are accepted as ever; a result that
+// says false is not.
+func TestNvidiaScrubWipedField(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body   string
+		vendor hw.Vendor
+		hold   bool
+	}{
+		"omitted":           {`{"ok":true,"mode":"scrub","gpus":[{"uuid":"GPU-a","ok":true}]}`, hw.VendorNvidia, false},
+		"wiped true":        {`{"ok":true,"wiped":true,"gpus":[{"uuid":"GPU-a","ok":true}]}`, hw.VendorNvidia, false},
+		"wiped false":       {`{"ok":true,"wiped":false,"gpus":[{"uuid":"GPU-a","ok":true}]}`, hw.VendorNvidia, true},
+		"not ok":            {`{"ok":false,"error":"12 words read back wrong","gpus":[{"uuid":"GPU-a","ok":false}]}`, hw.VendorNvidia, true},
+		"vendor unrecorded": {`{"ok":true,"gpus":[{"uuid":"GPU-a","ok":true}]}`, "", false},
+	} {
+		err, held, script := scrubOutcome(t, 0, tc.vendor, tc.body)
+		if script != ScrubScript {
+			t.Errorf("%s: the scrub VM ran the wrong script", name)
+		}
+		if tc.hold != (err != nil) || tc.hold != held[0] {
+			t.Errorf("%s: create error %v, held %v; want hold = %v", name, err, held, tc.hold)
+		}
+	}
+}
+
+// A Gaudi baseboard is taken whole: no VM may hold a subset of the modules.
+func TestGaudiVMTakesEveryModule(t *testing.T) {
+	f := newFixture(t)
+	f.m.GPUs[0].Vendor, f.m.GPUs[1].Vendor = hw.VendorHabana, hw.VendorHabana
+	f.prepTap(t, "vm-a")
+	ctx := context.Background()
+	for _, gpus := range [][]int{{0}, {1}} {
+		if _, err := f.m.Create(ctx, spec("vm-x", gpus...)); err == nil || !strings.Contains(err.Error(), "must take all 2 Gaudi modules") {
+			t.Fatalf("a VM with GPUs %v: %v", gpus, err)
+		}
+	}
+	if _, err := f.m.Create(ctx, spec("vm-a", 0, 1)); err != nil {
+		t.Fatalf("a VM with every module: %v", err)
+	}
+	if v := f.m.VMVendor("vm-a"); v != hw.VendorHabana {
+		t.Fatalf("VMVendor = %q", v)
+	}
+	if v := f.m.VMVendor("nope"); v != "" {
+		t.Fatalf("VMVendor of an unknown VM = %q", v)
+	}
+}
+
+// Mixed host: the Gaudi rule counts the Gaudi modules, the NVSwitch rule only
+// the NVIDIA GPUs, and a Gaudi VM never gets the NVSwitches.
+func TestMixedHostWholeNodeRules(t *testing.T) {
+	f := newFixture(t)
+	f.m.GPUs[0].Vendor, f.m.GPUs[1].Vendor = hw.VendorHabana, hw.VendorHabana
+	f.m.GPUs = append(f.m.GPUs, hw.GPU{Index: 2, Address: "0000:43:00.0", Vendor: hw.VendorNvidia}, hw.GPU{Index: 3, Address: "0000:44:00.0", Vendor: hw.VendorNvidia})
+	f.m.NVSwitches = []string{"0000:e1:00.0"}
+	f.prepTap(t, "vm-g")
+	ctx := context.Background()
+	// 2 and 3 are the NVIDIA GPUs of an NVSwitch node: one alone is refused, as ever.
+	if _, err := f.m.Create(ctx, spec("vm-n", 2)); err == nil || !strings.Contains(err.Error(), "NVSwitch node: a VM must take all 2 GPUs") {
+		t.Fatalf("one NVIDIA GPU of the NVSwitch node: %v", err)
+	}
+	// 0 and 1 are Gaudi modules: one alone is refused.
+	if _, err := f.m.Create(ctx, spec("vm-g", 0)); err == nil || !strings.Contains(err.Error(), "Gaudi baseboard: a VM must take all 2 Gaudi modules") {
+		t.Fatalf("one Gaudi module of two: %v", err)
+	}
+	if _, err := f.m.Create(ctx, spec("vm-g", 0, 1)); err != nil {
+		t.Fatalf("every Gaudi module: %v", err)
+	}
+	for _, c := range f.host.calls {
+		if strings.HasPrefix(c, "systemd-run") && strings.Contains(c, "0000:e1:00.0") {
+			t.Fatalf("a Gaudi VM got the NVSwitches:\n%s", c)
+		}
 	}
 }
 

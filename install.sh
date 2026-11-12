@@ -357,10 +357,16 @@ gpu_processes() {
 # hl_smi_gpus: "bus id, name, memory MiB" per Gaudi from the host's Habana driver,
 # empty without hl-smi (or while the driver has no device). The same query the agent
 # runs (cmd/runcrate-host/host.go habanaSMI); its format is not verified on a Gaudi
-# box yet (GAUDI-NOTES.md).
+# box yet (GAUDI-NOTES.md). A hung Habana driver must not hang the install: with
+# `timeout` available the call is cut off after 60 seconds (the agent's own call
+# has a 30 second deadline).
 hl_smi_gpus() {
 	command -v hl-smi >/dev/null 2>&1 || return 0
-	hl-smi --query-aip=bus_id,name,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 60 hl-smi --query-aip=bus_id,name,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+	else
+		hl-smi --query-aip=bus_id,name,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+	fi
 }
 
 # gaudi_processes: "pid name" of the processes holding a Gaudi device node open;
@@ -720,6 +726,11 @@ install_agent() {
 # `options vfio-pci ids=` does what `vfio-pci.ids=` on the kernel command line
 # does, with the NVIDIA ones the same way; habanalabs gets a softdep like nvidia
 # (only where there is a Gaudi, so an NVIDIA host's file stays what it was).
+# NOTE: `ids=` lists the id of EVERY non-bridge function of vendor 1da3 (and
+# 10de) on the machine, which is broader than gaudi_gpus (class 0x12xx/0x03xx):
+# a Habana NIC or management function with its own id is claimed by vfio-pci at
+# boot too. Likewise the agent's `release-gpus` (uninstall) gives back EVERY
+# 1da3 function that is bound to vfio-pci, not only the accelerators.
 vfio_modprobe_conf() {
 	ids=$({ lspci -nd 10de:; lspci -nd 1da3:; } | awk '$2 !~ /^0604/ {print $3}' | sort -u | paste -sd, -)
 	printf '# Written by the Runcrate host installer. Removed by --uninstall.\noptions vfio-pci ids=%s\nsoftdep nvidia pre: vfio-pci\nsoftdep nouveau pre: vfio-pci\nsoftdep snd_hda_intel pre: vfio-pci\nsoftdep xhci_pci pre: vfio-pci\n' "$ids"
@@ -733,6 +744,15 @@ take_gpus() {
 		busy=$(gpu_processes)
 		[ -z "$busy" ] || die "these processes are using the GPUs; stop them and run again:
 $busy"
+	fi
+	# Every busy check comes before anything is stopped, so an abort leaves
+	# the machine as it was.
+	if takes_vendor "$(gaudi_gpus)"; then
+		busy=$(gaudi_processes)
+		[ -z "$busy" ] || die "these processes are using the Gaudi accelerators; stop them and run again:
+$busy"
+	fi
+	if takes_vendor "$(nvidia_gpus)"; then
 		for u in nvidia-persistenced.service nvidia-fabricmanager.service; do
 			if systemctl is-enabled --quiet "$u" 2>/dev/null || systemctl is-active --quiet "$u" 2>/dev/null; then
 				systemctl disable --now "$u" >/dev/null 2>&1 || true
@@ -740,11 +760,6 @@ $busy"
 				say "Stopped $u (turned back on by --uninstall)."
 			fi
 		done
-	fi
-	if takes_vendor "$(gaudi_gpus)"; then
-		busy=$(gaudi_processes)
-		[ -z "$busy" ] || die "these processes are using the Gaudi accelerators; stop them and run again:
-$busy"
 	fi
 	if [ -z "$GPUS" ] && ! grep -q '"gpus"' "$CONF_DIR/config.json" 2>/dev/null; then
 		# Every NVIDIA and Gaudi function (not bridges) goes to vfio-pci at boot,
@@ -900,6 +915,12 @@ check_gaudi() {
 		none) detail "driver: none; the install binds it to vfio-pci" ;;
 		*) detail "driver: $driver; the install moves it to vfio-pci" ;;
 	esac
+	# A Gaudi with no reset method is not reset between tenants: leftover HBM
+	# and firmware state would reach the next customer. Not a block (the box
+	# test needs the module registered), but never silent.
+	if [ -z "$(tr -d '[:space:]' < "$PCI_DEVICES/$a/reset_method" 2>/dev/null)" ]; then
+		report WARN "GPU $a: no reset method: the module is not reset between tenants; customer launches stay off until the box test shows HBM is cleared"
+	fi
 	if [ "$ok" -eq 1 ]; then usable="${usable:+$usable,}$a"; else unusable=$((unusable + 1)); fi
 }
 

@@ -37,6 +37,8 @@ type VMs interface {
 	FreeGPUs(withHeld bool) []int
 	// GPUVendor is the vendor of a registered GPU, from its record.
 	GPUVendor(index int) hw.Vendor
+	// VMVendor is the GPU vendor of a VM on this host ("" when unknown).
+	VMVendor(id string) hw.Vendor
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
 	Hold(gpus []int)
@@ -390,10 +392,13 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 			return nil, fmt.Errorf("bad vm_id %q", p.VMID)
 		}
 		defer a.lock("vm:" + p.VMID)()
+		gaudi := a.VMs.VMVendor(p.VMID) == hw.VendorHabana
 		if err := a.VMs.Destroy(ctx, p.VMID); err != nil {
 			return nil, err
 		}
-		return map[string]any{"vm_id": p.VMID, "wiped": true}, nil
+		// "wiped" is what the host knows: the Gaudi scrub can't overwrite memory
+		// (see vm.GaudiScrubScript), so a Gaudi VM's GPUs are not wiped.
+		return map[string]any{"vm_id": p.VMID, "wiped": !gaudi}, nil
 
 	case api.KindReclaimNotice:
 		p, err := decode[api.ReclaimNotice](c.Payload)
@@ -512,6 +517,7 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	sort.Ints(free)
 	var gpuErr string
 	var passed, failed []int
+	visibilityOnly := 0
 	if len(free) > 0 && p.ImageVersion != "" && a.Images != nil {
 		// Fetch the image before the VM takes the GPUs, so a multi-GB
 		// download doesn't hold them. Without it nothing boots: every GPU is
@@ -591,6 +597,18 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 				} else if gpuErr == "" {
 					g.Error = "gpu not visible inside the benchmark vm"
 				}
+				if group.vendor == hw.VendorHabana {
+					// The VM only counted the accelerators: nothing was tested, so
+					// nothing passed (mem_ok and matmul_ok are false whatever the
+					// script said) and nothing failed: the hold state is left as
+					// it is, and the control plane decides (a Gaudi GPU is
+					// "pending manual" until the on-box tests are done).
+					g.MemOK, g.MatmulOK, g.MemTestedGB, g.MatmulTFLOPSFP16 = false, false, 0, 0
+					g.VisibilityOnly, g.VisibleCount = true, len(vb.GPUs)
+					visibilityOnly++
+					req.GPUs = append(req.GPUs, g)
+					continue
+				}
 				switch {
 				case g.MemOK && g.MatmulOK:
 					passed = append(passed, idx)
@@ -648,7 +666,7 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	if err != nil {
 		return nil, fmt.Errorf("post benchmark: %w", err)
 	}
-	return map[string]any{
+	res := map[string]any{
 		"verified": resp.Verified,
 		"reasons":  resp.Reasons,
 		"gpus":     len(req.GPUs),
@@ -656,7 +674,12 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		"disk":     req.Disk,
 		"net":      req.Net,
 		"error":    gpuErr,
-	}, nil
+	}
+	if visibilityOnly > 0 {
+		// Gaudi GPUs the benchmark only saw, not tested: not in gpus_ok.
+		res["gpus_visibility_only"] = visibilityOnly
+	}
+	return res, nil
 }
 
 // Size caps keep a benchmark well under the control plane's 64 KiB body

@@ -105,7 +105,8 @@ say "gaudi accelerators: $n"
 
 // GaudiScrubScript checks every accelerator reached the VM. It does NOT
 // overwrite their memory: that takes Intel's software, which the image doesn't
-// carry; "wiped": false says so, and the host logs it.
+// carry; "wiped": false says so, and the host (Manager.checkScrub) reads that
+// as a failed scrub: the modules stay held back.
 const GaudiScrubScript = gaudiPrelude + `
 [ "$n" -gt 0 ] || fail "no Gaudi accelerator is visible in the VM"
 say scrub
@@ -121,9 +122,9 @@ poweroff
 `
 
 // gaudiBenchGPUs reports what the VM can tell without Intel's software: how
-// many accelerators it sees, their names from the PCI ids. No memory or
-// compute is tested (mem_tested_gb and the TFLOPS are 0, and the evidence text
-// says so).
+// many accelerators it sees (visible_count), their names from the PCI ids. No
+// memory or compute is tested, so mem_ok and matmul_ok are false and
+// visibility_only is true; the agent sets those itself for Gaudi too.
 const gaudiBenchGPUs = `
 say "isolation checks done"
 gaudi_pci > "$out/pci.txt"
@@ -147,9 +148,9 @@ for i in range(n):
         except OSError:
             dev = ""
         name = NAMES.get(dev, "Intel Habana " + dev[2:])
-    gpus.append({"ordinal": i, "name": name, "uuid": "", "vram_gb": 0, "mem_ok": True, "mem_tested_gb": 0,
-                 "matmul_ok": True, "matmul_tflops_fp16": 0,
-                 "nvidia_smi": "intel gaudi: seen by the VM only. Memory and compute were NOT tested (the image carries no Intel software).",
+    gpus.append({"ordinal": i, "name": name, "uuid": "", "vram_gb": 0, "mem_ok": False, "mem_tested_gb": 0,
+                 "matmul_ok": False, "matmul_tflops_fp16": 0, "visibility_only": True, "visible_count": n,
+                 "nvidia_smi": "intel gaudi: seen by the VM only (visibility_only). Memory and compute were NOT tested (the image carries no Intel software).",
                  "error": ""})
 iso = []
 for line in rd("iso.txt", 20000).splitlines():

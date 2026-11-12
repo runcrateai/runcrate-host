@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/config"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 )
 
 const (
@@ -23,6 +25,8 @@ const (
 type fakeTools struct {
 	out   map[string]string
 	calls []string
+	// deadlines is the time left on each command's context, by command.
+	deadlines map[string]time.Duration
 }
 
 func (f *fakeTools) tool() smiTool {
@@ -38,6 +42,12 @@ func (f *fakeTools) tool() smiTool {
 		run: func(ctx context.Context, bin string, args ...string) ([]byte, error) {
 			key := filepath.Base(bin) + " " + strings.Join(args, " ")
 			f.calls = append(f.calls, key)
+			if dl, ok := ctx.Deadline(); ok {
+				if f.deadlines == nil {
+					f.deadlines = map[string]time.Duration{}
+				}
+				f.deadlines[key] = time.Until(dl)
+			}
 			if o, ok := f.out[key]; ok {
 				return []byte(o), nil
 			}
@@ -182,9 +192,62 @@ func TestMemoryGB(t *testing.T) {
 		"abc":       0,
 		"0":         0,
 		"-5":        0,
+		"NaN":       0,
+		"nan MiB":   0,
+		"Inf":       0,
+		"+Inf GiB":  0,
+		"-Inf":      0,
+		"1e308":     0,
+		"2000 GiB":  0, // above 1 TiB
+		"1024 GiB":  1024,
+		"1048576":   1024, // 1 TiB in MiB
+		"2097152":   0,
 	} {
 		if got := memoryGB(in); got != want {
 			t.Errorf("memoryGB(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// hl-smi gets a deadline (a hung Habana driver must not hang the agent's
+// start); nvidia-smi's calls are as they were, with none.
+func TestHlSmiHasADeadline(t *testing.T) {
+	f := &fakeTools{out: map[string]string{
+		habanaQuery: "0000:19:00.0, HL-325L, 131072\n",
+		nvidiaQuery: "00000000:41:00.0, NVIDIA H100 80GB HBM3, 81559, GPU-1\n",
+		nvidiaTopo:  "GPU0 X\n",
+	}}
+	if _, err := f.snapshot(t, newCfg(t)); err != nil {
+		t.Fatal(err)
+	}
+	dl, ok := f.deadlines[habanaQuery]
+	if !ok || dl <= 0 || dl > 30*time.Second {
+		t.Fatalf("hl-smi deadline = %v, %v; want one of at most 30s", dl, ok)
+	}
+	if len(f.deadlines) != 1 {
+		t.Fatalf("only hl-smi may get a deadline: %v", f.deadlines)
+	}
+}
+
+// Gaudi OAM modules sit on one baseboard: a Gaudi host is only rented whole.
+func TestTopologyPartialVMOK(t *testing.T) {
+	nv := hw.GPU{Vendor: hw.VendorNvidia}
+	gd := hw.GPU{Vendor: hw.VendorHabana}
+	for _, tc := range []struct {
+		name       string
+		gpus       []hw.GPU
+		nvswitches []string
+		want       bool
+	}{
+		{"nvidia", []hw.GPU{nv, nv}, nil, true},
+		{"nvidia without a recorded vendor", []hw.GPU{{}, {}}, nil, true},
+		{"nvswitch node", []hw.GPU{nv, nv}, []string{"0000:e1:00.0"}, false},
+		{"gaudi baseboard", []hw.GPU{gd, gd, gd, gd, gd, gd, gd, gd}, nil, false},
+		{"mixed", []hw.GPU{nv, gd}, nil, false},
+	} {
+		h := &host{gpus: tc.gpus, nvswitches: tc.nvswitches, sys: hw.Sys{Root: t.TempDir()}}
+		if got := h.Topology().PartialVMOK; got != tc.want {
+			t.Errorf("%s: PartialVMOK = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

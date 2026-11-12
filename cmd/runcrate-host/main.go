@@ -193,6 +193,9 @@ func bindGPUs(cfg *config.Config) error {
 }
 
 // releaseGPUs gives every NVIDIA and Intel Gaudi function on vfio-pci back to the host.
+// "Every" is meant: any function of a GPU vendor (10de, 1da3) bound to vfio-pci
+// is released, accelerator or not (a Habana NIC or management function the
+// boot-time ids= line claimed goes back too).
 func releaseGPUs(cfg *config.Config) error {
 	devs, err := hw.Host.Devices()
 	if err != nil {
@@ -635,6 +638,9 @@ func cmdStatus(ctx context.Context, dir string) error {
 		line := fmt.Sprintf("  %d  %s  %-40s driver=%s health=%s", g.Index, g.Address, g.ModelRaw, orDash(d.Driver), hw.Host.Health(g.Address))
 		if g.Blocker != "" {
 			line += "  BLOCKED: " + g.Blocker
+		}
+		if g.Vendor == hw.VendorHabana && g.ResetMethod == "" {
+			line += "  WARN: no reset method (not reset between tenants; see GAUDI-NOTES.md)"
 		}
 		fmt.Println(line)
 	}

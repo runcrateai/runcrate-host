@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
 	"github.com/runcrateai/runcrate-host/internal/bench"
@@ -113,6 +115,8 @@ func (h habanaSMI) snapshot(ctx context.Context, c *gpuCache) bool {
 	if err != nil {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(ctx, hlSMITimeout)
+	defer cancel()
 	out, err := h.output(ctx, smi, "--query-aip=bus_id,name,memory.total", "--format=csv,noheader,nounits")
 	if err != nil {
 		return false // driver gone from the GPUs (already on vfio-pci)
@@ -133,21 +137,34 @@ func (h habanaSMI) snapshot(ctx context.Context, c *gpuCache) bool {
 	return seen
 }
 
+// hlSMITimeout bounds each hl-smi call: a hung Habana driver must not hang the
+// agent's start.
+const hlSMITimeout = 30 * time.Second
+
+// maxMemoryGB is the most a GPU's memory is believed to be (1 TiB): a larger
+// number from hl-smi is a parse problem or hostile output, not a card.
+const maxMemoryGB = 1024
+
 // memoryGB reads hl-smi's memory.total: MiB when it has no unit (nounits), GiB
-// or GB when it says so. 0 when unreadable.
+// or GB when it says so. 0 when unreadable, not finite, not positive or above
+// maxMemoryGB.
 func memoryGB(s string) int {
 	f := strings.Fields(s)
 	if len(f) == 0 {
 		return 0
 	}
 	n, err := strconv.ParseFloat(f[0], 64)
-	if err != nil || n <= 0 {
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
 		return 0
 	}
+	gb := n / 1024
 	if len(f) > 1 && (f[1] == "GiB" || f[1] == "GB") {
-		return int(n + 0.5)
+		gb = n
 	}
-	return int(n/1024 + 0.5)
+	if gb > maxMemoryGB {
+		return 0
+	}
+	return int(gb + 0.5)
 }
 
 // snapshotGPUs asks the host's vendor tools (if any) for names, VRAM, UUIDs
@@ -181,6 +198,16 @@ func normalizeBusID(s string) string {
 		s = s[i-4:]
 	}
 	return s
+}
+
+// hasHabana reports whether any registered GPU is an Intel Gaudi module.
+func (h *host) hasHabana() bool {
+	for _, g := range h.gpus {
+		if g.Vendor == hw.VendorHabana {
+			return true
+		}
+	}
+	return false
 }
 
 // host implements agent.Host.
@@ -293,7 +320,7 @@ func (h *host) Topology() api.Topology {
 		Interconnect:  "unknown",
 		NVSwitchCount: len(h.nvswitches),
 		NVLinkMatrix:  h.cacheTopo,
-		PartialVMOK:   len(h.nvswitches) == 0,
+		PartialVMOK:   len(h.nvswitches) == 0 && !h.hasHabana(),
 		NICs:          h.sys.NICs(),
 		PrivateAddrs:  hw.PrivateAddrs(h.subnet),
 	}

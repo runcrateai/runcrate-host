@@ -455,6 +455,30 @@ func (m *Manager) vendorOf(gpus []int) hw.Vendor {
 // GPUVendor is the vendor of one registered GPU ("" when the index is unknown).
 func (m *Manager) GPUVendor(idx int) hw.Vendor { return m.vendorOf([]int{idx}) }
 
+// VMVendor is the GPU vendor of a VM on this host ("" when it has no GPUs or
+// isn't here).
+func (m *Manager) VMVendor(id string) hw.Vendor {
+	m.mu.Lock()
+	r, ok := m.vms[id]
+	m.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	return m.vendorOf(r.GPUIndexes)
+}
+
+// vendorCount is how many of the host's GPUs belong to the vendor v is (a GPU
+// with no vendor recorded is NVIDIA).
+func (m *Manager) vendorCount(v hw.Vendor) int {
+	n := 0
+	for _, g := range m.GPUs {
+		if (g.Vendor == hw.VendorHabana) == (v == hw.VendorHabana) {
+			n++
+		}
+	}
+	return n
+}
+
 // ErrCapacity means the host can't fit the VM.
 var ErrCapacity = errors.New("not enough capacity on this host")
 
@@ -486,8 +510,13 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		vendor = gpu.Vendor
 		seen[g] = true
 	}
-	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != len(m.GPUs) {
-		return nil, false, fmt.Errorf("this is an NVSwitch node: a VM must take all %d GPUs", len(m.GPUs))
+	if vendor == hw.VendorHabana && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != m.vendorCount(hw.VendorHabana) {
+		// The OAM modules are linked to each other on the baseboard, so a
+		// VM that held some would sit next to modules another tenant holds.
+		return nil, false, fmt.Errorf("this is a Gaudi baseboard: a VM must take all %d Gaudi modules", m.vendorCount(hw.VendorHabana))
+	}
+	if len(m.NVSwitches) > 0 && vendor != hw.VendorHabana && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != m.vendorCount(vendor) {
+		return nil, false, fmt.Errorf("this is an NVSwitch node: a VM must take all %d GPUs", m.vendorCount(vendor))
 	}
 	deadline := time.Now().Add(15 * time.Minute)
 	for {
@@ -579,7 +608,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 			r.PassThrough = append(r.PassThrough, gpu.Address)
 		}
 	}
-	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) == len(m.GPUs) && !m.NoPassthrough {
+	if len(m.NVSwitches) > 0 && vendor != hw.VendorHabana && len(s.GPUIndexes) == m.vendorCount(vendor) && !m.NoPassthrough {
 		r.PassThrough = append(r.PassThrough, m.NVSwitches...)
 	}
 	m.vms[s.ID] = r
@@ -1100,7 +1129,7 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 	m.mu.Unlock()
 	_ = os.Remove(m.scrubMarker(after))
 	if err != nil {
-		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes", "after", after, "gpus", gpus, "err", err)
+		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes (Gaudi: until the box test and a manual clear)", "after", after, "gpus", gpus, "err", err)
 	}
 }
 
@@ -1108,8 +1137,9 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 // when the host knows it: a GPU missing from the VM was not wiped.
 func (m *Manager) checkScrub(out []byte, gpus []int) error {
 	var res struct {
-		OK   bool `json:"ok"`
-		GPUs []struct {
+		OK    bool  `json:"ok"`
+		Wiped *bool `json:"wiped"`
+		GPUs  []struct {
 			UUID string `json:"uuid"`
 			OK   bool   `json:"ok"`
 		} `json:"gpus"`
@@ -1117,6 +1147,16 @@ func (m *Manager) checkScrub(out []byte, gpus []int) error {
 	}
 	if err := json.Unmarshal(out, &res); err != nil {
 		return fmt.Errorf("scrub output: %w", err)
+	}
+	// An explicit "wiped": false is a failure for every vendor. An Intel Gaudi
+	// result must also say "wiped": true: the Gaudi scrub script can't
+	// overwrite HBM (no Intel software is bundled), so a result that doesn't
+	// claim a wipe is not one. NVIDIA results that omit it stay accepted.
+	if res.Wiped != nil && !*res.Wiped {
+		return fmt.Errorf("scrub did not wipe the GPU memory (wiped: false)")
+	}
+	if res.Wiped == nil && m.vendorOf(gpus) == hw.VendorHabana {
+		return fmt.Errorf("scrub result does not say the GPU memory was wiped")
 	}
 	if !res.OK {
 		return fmt.Errorf("scrub reported failure: %s", truncate(res.Error, 300))

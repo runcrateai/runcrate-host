@@ -144,6 +144,12 @@ type BenchmarkGPU struct {
 	MatmulOK         bool    `json:"matmul_ok"`
 	NvidiaSMI        string  `json:"nvidia_smi"`
 	Error            string  `json:"error,omitempty"`
+	// VisibilityOnly is set for Intel Gaudi: the benchmark VM only counted the
+	// accelerators it saw (VisibleCount), it did not test memory or compute, so
+	// MemOK and MatmulOK are false. The control plane treats it as "pending
+	// manual", not as a failure. Omitted for NVIDIA.
+	VisibilityOnly bool `json:"visibility_only,omitempty"`
+	VisibleCount   int  `json:"visible_count,omitempty"`
 }
 
 // DiskBench is the host disk result.

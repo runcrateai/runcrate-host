@@ -112,7 +112,7 @@ if ! diff "$T/web" "$T/installer" > "$T/diff"; then
 fi
 
 # Intel Gaudi 3 (family gaudi3): install.sh sells it, under the names the agent and
-# hl-smi give it. The web app must name it too, as Gaudi3 (hosts register the name
+# hl-smi give it. The web app must name it too, as Gaudi3 (the app's code may differ in case: GAUDI3; hosts register the name
 # the agent reports); while its list lacks it, that is reported, not failed, since
 # the web app is not in this repo.
 printf 'Gaudi3 [HL-325L]\t\nIntel Gaudi 3 OAM\t\nIntel Gaudi 3 PCIe\t\nHL-325L\t128\n' > "$T/names.gaudi"
@@ -121,10 +121,10 @@ tab=$(printf '\t')
 while IFS= read -r line; do
 	name=${line%%"$tab"*}; rest=${line#*"$tab"}; mem=${rest%%"$tab"*}; code=${rest#*"$tab"}
 	mine=$(gpu_model "$name" "$mem") || mine=-
-	if [ "$mine" != Gaudi3 ]; then echo "install.sh's gpu_model '$name' = $mine, want Gaudi3" >&2; exit 1; fi
+	if [ "$(printf '%s' "$mine" | tr '[:upper:]' '[:lower:]')" != gaudi3 ]; then echo "install.sh's gpu_model '$name' = $mine, want Gaudi3" >&2; exit 1; fi
 	if [ "$code" = - ]; then
 		echo "note: the web app's gpuTypeFromName doesn't sell '$name' yet (install.sh says Gaudi3)" >&2
-	elif [ "$code" != Gaudi3 ]; then
+	elif [ "$(printf '%s' "$code" | tr '[:upper:]' '[:lower:]')" != gaudi3 ]; then
 		echo "the web app says '$name' = $code, install.sh says Gaudi3" >&2; exit 1
 	fi
 done < "$T/web.gaudi"

@@ -242,3 +242,25 @@ func TestNvidiaOnlyHostGolden(t *testing.T) {
 		t.Fatalf("bare NVIDIA = %+v", bare)
 	}
 }
+
+// ResetMethod is what the kernel offers for the function; "" when the file is
+// missing or empty (a Gaudi the kernel can't reset between tenants).
+func TestGPUResetMethod(t *testing.T) {
+	tr := tree{t, t.TempDir()}
+	tr.dev("0000:10:00.0", "0x1da3", "0x1060", "0x120000", "habanalabs", "1")
+	tr.file("sys/bus/pci/devices/0000:10:00.0/reset_method", "flr bus\n")
+	tr.dev("0000:11:00.0", "0x1da3", "0x1060", "0x120000", "habanalabs", "2") // no file
+	tr.dev("0000:12:00.0", "0x1da3", "0x1060", "0x120000", "habanalabs", "3")
+	tr.file("sys/bus/pci/devices/0000:12:00.0/reset_method", "\n") // empty
+	tr.dev("0000:41:00.0", "0x10de", "0x2330", "0x030200", "nvidia", "4")
+	tr.file("sys/bus/pci/devices/0000:41:00.0/reset_method", "flr\n")
+	gpus, err := Sys{Root: tr.root}.GPUs(nil, nil, nil)
+	if err != nil || len(gpus) != 4 {
+		t.Fatalf("gpus = %+v, %v", gpus, err)
+	}
+	for i, want := range []string{"flr bus", "", "", "flr"} {
+		if gpus[i].ResetMethod != want {
+			t.Errorf("gpu %d (%s): ResetMethod %q, want %q", i, gpus[i].Address, gpus[i].ResetMethod, want)
+		}
+	}
+}

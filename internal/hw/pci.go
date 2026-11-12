@@ -243,6 +243,10 @@ type GPU struct {
 	// VRAMFallback marks a VRAMGB taken from our device table because no host
 	// tool reported it.
 	VRAMFallback bool
+	// ResetMethod is the kernel's reset_method for the function ("flr bus"),
+	// "" when the file is missing or empty: the kernel knows no way to reset
+	// the device between tenants.
+	ResetMethod string
 }
 
 // Cached is what the host's vendor tool (nvidia-smi, hl-smi) said about a GPU before the
@@ -289,6 +293,7 @@ func (s Sys) GPUs(only []string, cache map[string]Cached, ids *PCIIDs) ([]GPU, e
 				g.VRAMGB, g.VRAMFallback = di.VRAMGB, di.VRAMGB > 0
 			}
 		}
+		g.ResetMethod = readTrim(s.p("sys/bus/pci/devices", d.Address, "reset_method"))
 		switch members, err := s.GroupMembers(d.IOMMUGroup); {
 		case s.acsOverride():
 			g.Blocker = "the kernel runs with pcie_acs_override, so IOMMU groups don't prove isolation; remove it from the kernel command line"

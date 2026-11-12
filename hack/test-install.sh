@@ -140,6 +140,8 @@ dev() {
 		: > "$M/groups/$6/devices/$1"
 	fi
 }
+# set_reset ADDR METHODS: the kernel's reset_method file for a function.
+set_reset() { echo "$2" > "$M/devices/$1/reset_method"; }
 new_machine() {
 	rm -rf "$M"
 	mkdir -p "$M/devices" "$M/groups" "$M/dmi" "$M/acpi"
@@ -251,6 +253,8 @@ printf '1da3  Habana Labs Ltd.\n\t1060  Gaudi3 [HL-325L]\n' >> "$M/pci.ids"
 dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
 dev 0000:18:01.0 0x8086 0x1234 0x060400 pcieport 1
 dev 0000:3b:00.0 0x1da3 0x1060 0x120000 habanalabs 2
+set_reset 0000:19:00.0 "flr bus"
+set_reset 0000:3b:00.0 "flr bus"
 out=$(run_case)
 has "PASS  GPU 0000:19:00.0: Gaudi3 [HL-325L], sold as Gaudi3" "gaudi ready"
 has "PASS  GPU 0000:3b:00.0: Gaudi3 [HL-325L], sold as Gaudi3" "gaudi ready"
@@ -277,6 +281,9 @@ dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
 dev 0000:1a:00.0 0x15b3 0x1021 0x020000 mlx5_core 1
 dev 0000:3b:00.0 0x1da3 0x1060 0x120000 habanalabs 2
 dev 0000:5c:00.0 0x1da3 0x1ffe 0x120000 "" 3
+set_reset 0000:19:00.0 "flr bus"
+set_reset 0000:3b:00.0 "flr bus"
+set_reset 0000:5c:00.0 "flr bus"
 out=$(run_case)
 has "WARN  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi shared group"
 has "can't be passed through: IOMMU group 1 also holds 0000:1a:00.0 (class 0x020000)" "gaudi shared group"
@@ -290,11 +297,33 @@ has "exit=0" "gaudi shared group"
 new_machine
 dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
 dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+set_reset 0000:19:00.0 "flr bus"
 out=$(run_case)
 has "PASS  GPU 0000:41:00.0: GH100 [H100 SXM5 80GB], sold as H100" "mixed host"
 has "PASS  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "mixed host"
 has "driver: nvidia; the install moves it to vfio-pci (stopping nvidia-persistenced" "mixed host"
 has "Verdict: READY." "mixed host"
+
+# 7l. A Gaudi with no reset method (the file missing, or empty) gets a WARN: not a block, never silent.
+new_machine
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+dev 0000:3b:00.0 0x1da3 0x1060 0x120000 habanalabs 2
+dev 0000:5c:00.0 0x1da3 0x1060 0x120000 habanalabs 3
+set_reset 0000:3b:00.0 "flr bus"
+: > "$M/devices/0000:5c:00.0/reset_method"
+out=$(run_case)
+warn_text="no reset method: the module is not reset between tenants; customer launches stay off until the box test shows HBM is cleared"
+has "WARN  GPU 0000:19:00.0: $warn_text" "gaudi without a reset_method file"
+has "WARN  GPU 0000:5c:00.0: $warn_text" "gaudi with an empty reset_method"
+hasnt "WARN  GPU 0000:3b:00.0" "gaudi with a reset method"
+has "PASS  GPU 0000:19:00.0: Intel Gaudi 3 OAM, sold as Gaudi3" "gaudi without a reset method is still usable"
+has "Verdict: READY." "gaudi without a reset method"
+has "exit=0" "gaudi without a reset method"
+# NVIDIA hosts are not asked about it.
+new_machine
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+out=$(run_case)
+hasnt "no reset method" "nvidia without a reset_method file"
 
 # 8. check_machine, the install's own checks, on the same fake machines.
 # check_case: check_machine against the fake machine; its output and "exit=N".
@@ -374,6 +403,37 @@ got=$(. "$REPO/install.sh"; GAUDI_DEVS="$T/accel/*"; gaudi_processes)
 got=$(. "$REPO/install.sh"; GAUDI_DEVS="$T/none/*"; gaudi_processes)
 [ -z "$got" ] || fail "gaudi_processes without device nodes = '$got'"
 rm -f "$T/bin/fuser"
+
+# 8d. take_gpus runs every busy check before it stops anything: a busy Gaudi aborts
+# the install with no NVIDIA service touched; when nothing is busy they are stopped.
+new_machine
+dev 0000:41:00.0 0x10de 0x2330 0x030200 nvidia 20
+dev 0000:19:00.0 0x1da3 0x1060 0x120000 habanalabs 1
+: > "$T/systemctl.log"
+rm -f "$T/disabled"
+printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\nexit 0\n' "$T" > "$T/bin/systemctl"
+printf '#!/bin/sh\necho " 1"\n' > "$T/bin/fuser"
+chmod +x "$T/bin/systemctl" "$T/bin/fuser"
+mkdir -p "$T/accel2" && : > "$T/accel2/accel0"
+# take_case GAUDI_DEVS GPUS: take_gpus on the fake machine; its output and "exit=N".
+take_case() {
+	(
+		. "$REPO/install.sh"
+		PCI_DEVICES="$M/devices"; GAUDI_DEVS=$1; GPUS=$2; DISABLED_UNITS="$T/disabled"; CONF_DIR="$M/etc"
+		if take_gpus; then echo "exit=0"; else echo "exit=1"; fi
+	) 2>&1 || echo "exit=1"
+}
+out=$(take_case "$T/accel2/*" "")
+has "these processes are using the Gaudi accelerators" "busy gaudi"
+hasnt "exit=0" "busy gaudi"
+[ ! -s "$T/systemctl.log" ] || { cat "$T/systemctl.log" >&2; fail "a busy Gaudi aborted take_gpus after a service was touched"; }
+[ ! -e "$T/disabled" ] || fail "a busy Gaudi aborted take_gpus after a service was recorded as stopped"
+# Nothing busy (--gpus names the NVIDIA GPU only): the NVIDIA services are stopped.
+out=$(take_case "$T/none/*" "0000:41:00.0")
+has "exit=0" "nothing busy"
+grep -q 'disable --now nvidia-persistenced.service' "$T/systemctl.log" || fail "the NVIDIA services were not stopped when nothing was busy"
+grep -qx 'nvidia-persistenced.service' "$T/disabled" || fail "the stopped NVIDIA service was not recorded"
+rm -f "$T/bin/systemctl" "$T/bin/fuser"
 
 # 9. Options that take a value refuse a missing one, or the next option in its place.
 for args in "--name --check" "--gpus" "--data-dir -y" "--token-file --check"; do
