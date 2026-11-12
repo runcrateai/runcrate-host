@@ -985,8 +985,12 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		// A Gaudi can't be wiped here (no scrub VM runs, or it runs and fails:
 		// see GaudiScrubScript), so its modules are held back after every
 		// customer VM, whatever the partner set scrub_gpus to. The hold is
-		// persisted now, before anything else can fail.
-		m.Hold(gpus)
+		// persisted now, before anything else can change: if a marker can't be
+		// written the destroy stops here (the VM stays recorded and running), or
+		// a restart would forget the hold and free unwiped modules.
+		if err := m.holdDurably(gpus); err != nil {
+			return fmt.Errorf("gaudi modules can't be held back, vm %s not destroyed: %w", id, err)
+		}
 		m.Log.Warn("gaudi modules held back after a customer vm: their memory is not wiped", "vm", id, "gpus", gpus)
 	}
 	if scrub {
@@ -1092,10 +1096,22 @@ func (m *Manager) startScrub(id string, gpus []int) {
 // benchmark.
 func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 	owner := "scrub:" + after
-	if m.vendorOf(gpus) == hw.VendorHabana {
+	habana := m.vendorOf(gpus) == hw.VendorHabana
+	if habana {
 		m.Log.Warn("gaudi scrub only checks the accelerators reached the VM: their memory is not overwritten", "after", after, "gpus", gpus)
 	}
-	m.Hold(gpus)
+	heldOnDisk := true
+	if habana {
+		if herr := m.holdDurably(gpus); herr != nil {
+			// Held in memory only for now; the scrub marker stays until the
+			// hold is on disk, so a restart redoes the scrub and holds again.
+			heldOnDisk = false
+			m.Log.Error("gaudi hold marker not written", "after", after, "gpus", gpus, "err", herr)
+			m.Hold(gpus)
+		}
+	} else {
+		m.Hold(gpus)
+	}
 	m.mu.Lock()
 	for _, g := range gpus {
 		m.busy[g] = owner
@@ -1136,7 +1152,9 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		}
 	}
 	m.mu.Unlock()
-	_ = os.Remove(m.scrubMarker(after))
+	if !(err != nil && habana && !heldOnDisk && m.holdDurably(gpus) != nil) {
+		_ = os.Remove(m.scrubMarker(after))
+	}
 	if err != nil {
 		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes (Gaudi: until the box test and a manual clear)", "after", after, "gpus", gpus, "err", err)
 	}
@@ -1184,6 +1202,37 @@ func (m *Manager) checkScrub(out []byte, gpus []int) error {
 		if gpu, ok := m.gpu(idx); ok && gpu.UUID != "" && !seen[strings.ToLower(gpu.UUID)] {
 			return fmt.Errorf("gpu %d (%s) was not in the scrub", idx, gpu.UUID)
 		}
+	}
+	return nil
+}
+
+// holdDurably is Hold for Intel Gaudi modules, whose hold must outlive a
+// restart: it reports a marker that can't be written instead of logging it,
+// and then changes nothing (markers it created are removed, no GPU is marked
+// held in memory). Hold itself still only logs.
+func (m *Manager) holdDurably(gpus []int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.init()
+	if err := os.MkdirAll(filepath.Join(m.DataDir, "holds"), 0o700); err != nil {
+		return fmt.Errorf("holds directory: %w", err)
+	}
+	var created []string
+	for _, g := range gpus {
+		p := m.holdPath(g)
+		_, statErr := os.Stat(p)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			for _, c := range created {
+				_ = os.Remove(c)
+			}
+			return fmt.Errorf("hold marker for gpu %d: %w", g, err)
+		}
+		if statErr != nil {
+			created = append(created, p)
+		}
+	}
+	for _, g := range gpus {
+		m.scrubOK[g] = false
 	}
 	return nil
 }

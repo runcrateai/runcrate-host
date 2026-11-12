@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -270,6 +271,116 @@ func TestGaudiHoldDoesNotDependOnTheScrubSetting(t *testing.T) {
 		if started := f.host.startedIDs(); tc.held && len(started) != 1 {
 			t.Errorf("%s: a scrub VM started with the scrub off: %v", name, started)
 		}
+	}
+}
+
+// breakHolds makes the holds directory impossible to create (a regular file
+// stands where it should be) and returns a function that repairs it.
+func breakHolds(t *testing.T, f *fixture) (repair func()) {
+	t.Helper()
+	p := filepath.Join(f.m.DataDir, "holds")
+	if err := os.WriteFile(p, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// If the durable hold marker of a started customer Gaudi VM can't be written,
+// Destroy stops before touching the VM: it stays recorded and running, no hold
+// is claimed in memory; once the marker can be written the destroy goes through
+// and the hold is on disk.
+func TestGaudiDestroyAbortsWhenTheHoldCannotBePersisted(t *testing.T) {
+	f := newFixture(t)
+	f.m.GPUs[1].Vendor = hw.VendorHabana
+	f.m.Scrub = false
+	f.prepTap(t, "vm-a")
+	f.prepTap(t, "vm-b")
+	ctx := context.Background()
+	if _, err := f.m.Create(ctx, spec("vm-a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	repair := breakHolds(t, f)
+	err := f.m.Destroy(ctx, "vm-a")
+	if err == nil || !strings.Contains(err.Error(), "can't be held back") {
+		t.Fatalf("Destroy with an unwritable holds path: %v", err)
+	}
+	if v := f.m.VMVendor("vm-a"); v != hw.VendorHabana {
+		t.Fatalf("the VM is no longer recorded after the failed destroy (vendor %q)", v)
+	}
+	if l := f.m.List(ctx); len(l) != 1 || l[0].VMID != "vm-a" || l[0].State != StateRunning {
+		t.Fatalf("List = %+v, want vm-a still running", l)
+	}
+	for _, c := range f.host.calls {
+		if strings.HasPrefix(c, "systemctl stop") {
+			t.Fatalf("the VM was stopped despite the failed hold: %s", c)
+		}
+	}
+	if h := f.m.HeldGPUs(); len(h) != 0 {
+		t.Fatalf("HeldGPUs = %v after a hold that was not written", h)
+	}
+	// Repaired: the retry goes through and the marker is on disk.
+	repair()
+	if err := f.m.Destroy(ctx, "vm-a"); err != nil {
+		t.Fatalf("Destroy after the repair: %v", err)
+	}
+	if _, err := os.Stat(f.m.holdPath(1)); err != nil {
+		t.Fatalf("hold marker missing after the destroy: %v", err)
+	}
+	if _, err := f.m.Create(ctx, spec("vm-b", 1)); err == nil || !strings.Contains(err.Error(), "held back after a failed memory scrub") {
+		t.Fatalf("a new VM on the unwiped module: %v", err)
+	}
+}
+
+// With the scrub on, a Gaudi scrub always fails and holds; if that hold can't
+// be written the scrub marker is kept, so a restart redoes the scrub and holds
+// again instead of freeing the module.
+func TestGaudiScrubKeepsItsMarkerWhenTheHoldCannotBePersisted(t *testing.T) {
+	f := newFixture(t)
+	f.m.GPUs[1].Vendor = hw.VendorHabana
+	f.m.Scrub = true
+	f.answerEphemeral(`{"ok":true,"wiped":false,"gpus":[{"uuid":"","ok":true}]}`)
+	for _, id := range []string{"vm-a", "scrub-vm-a"} {
+		f.prepTap(t, id)
+	}
+	ctx := context.Background()
+	if _, err := f.m.Create(ctx, spec("vm-a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	breakHolds(t, f)
+	if err := f.m.Destroy(ctx, "vm-a"); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	f.m.Wait()
+	if _, err := os.Stat(f.m.scrubMarker("vm-a")); err != nil {
+		t.Fatalf("the scrub marker was removed although the hold is not on disk: %v", err)
+	}
+	if !f.m.HeldGPUs()[1] {
+		t.Fatalf("the module is not held in memory: %v", f.m.HeldGPUs())
+	}
+}
+
+// NVIDIA keeps its log-only behaviour: a broken holds path doesn't stop a
+// destroy, and Hold still marks the GPU held in memory.
+func TestNvidiaHoldStaysLogOnly(t *testing.T) {
+	f := newFixture(t)
+	f.m.GPUs[0].Vendor = hw.VendorNvidia
+	f.m.Scrub = false
+	f.prepTap(t, "vm-a")
+	ctx := context.Background()
+	if _, err := f.m.Create(ctx, spec("vm-a", 0)); err != nil {
+		t.Fatal(err)
+	}
+	breakHolds(t, f)
+	if err := f.m.Destroy(ctx, "vm-a"); err != nil {
+		t.Fatalf("an NVIDIA Destroy with an unwritable holds path: %v", err)
+	}
+	f.m.Hold([]int{0})
+	if !f.m.HeldGPUs()[0] {
+		t.Fatalf("Hold did not mark the GPU held in memory: %v", f.m.HeldGPUs())
 	}
 }
 
