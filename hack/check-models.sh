@@ -79,7 +79,8 @@ awk '/^const (MODEL_KEYS|RTX_KEYS)/ {on = 1; sub(/^[^{]*[{]/, "")}
 # Hosts are NVIDIA: AMD models stay out of the comparison.
 grep -v '^NVIDIA MI[0-9]' "$T/names" > "$T/names.nv"
 
-# The web app's answer for each name.
+# web_answers FILE: the web app's answer for each "NAME<tab>MEMORY_GB" line of FILE.
+web_answers() {
 # shellcheck disable=SC2016
 node --input-type=module -e '
 import { readFileSync } from "node:fs";
@@ -90,7 +91,11 @@ for (const line of lines) {
   const [name, mem = ""] = line.split("\t");
   const code = gpuTypeFromName(name, mem ? Number(mem) : undefined) ?? "-";
   process.stdout.write(`${name}\t${mem}\t${code}\n`);
-}' "$TS" < "$T/names.nv" > "$T/web"
+}' "$TS" < "$1"
+}
+
+# The web app's answer for each name.
+web_answers "$T/names.nv" > "$T/web"
 
 # install.sh's answer for each name.
 # shellcheck source=install.sh
@@ -105,4 +110,22 @@ if ! diff "$T/web" "$T/installer" > "$T/diff"; then
 	cat "$T/diff" >&2
 	exit 1
 fi
+
+# Intel Gaudi 3 (family gaudi3): install.sh sells it, under the names the agent and
+# hl-smi give it. The web app must name it too, as Gaudi3 (the app's code may differ in case: GAUDI3; hosts register the name
+# the agent reports); while its list lacks it, that is reported, not failed, since
+# the web app is not in this repo.
+printf 'Gaudi3 [HL-325L]\t\nIntel Gaudi 3 OAM\t\nIntel Gaudi 3 PCIe\t\nHL-325L\t128\n' > "$T/names.gaudi"
+web_answers "$T/names.gaudi" > "$T/web.gaudi"
+tab=$(printf '\t')
+while IFS= read -r line; do
+	name=${line%%"$tab"*}; rest=${line#*"$tab"}; mem=${rest%%"$tab"*}; code=${rest#*"$tab"}
+	mine=$(gpu_model "$name" "$mem") || mine=-
+	if [ "$(printf '%s' "$mine" | tr '[:upper:]' '[:lower:]')" != gaudi3 ]; then echo "install.sh's gpu_model '$name' = $mine, want Gaudi3" >&2; exit 1; fi
+	if [ "$code" = - ]; then
+		echo "note: the web app's gpuTypeFromName doesn't sell '$name' yet (install.sh says Gaudi3)" >&2
+	elif [ "$(printf '%s' "$code" | tr '[:upper:]' '[:lower:]')" != gaudi3 ]; then
+		echo "the web app says '$name' = $code, install.sh says Gaudi3" >&2; exit 1
+	fi
+done < "$T/web.gaudi"
 echo "ok: install.sh and the web app agree on $(wc -l < "$T/web" | tr -d ' ') GPU names ($(grep -cv '	-$' "$T/web") sold)"

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
 	"github.com/runcrateai/runcrate-host/internal/bench"
@@ -21,8 +23,8 @@ import (
 	"github.com/runcrateai/runcrate-host/internal/vm"
 )
 
-// gpuCacheFile holds what the host's NVIDIA driver said about each GPU before
-// the installer moved it to vfio-pci.
+// gpuCacheFile holds what the host's vendor tool (nvidia-smi, hl-smi) said
+// about each GPU before the installer moved it to vfio-pci.
 const gpuCacheFile = "gpus-cache.json"
 
 type gpuCache struct {
@@ -42,17 +44,47 @@ func loadGPUCache(cfg *config.Config) gpuCache {
 	return c
 }
 
-// snapshotGPUs asks the host driver (if any) for names, VRAM, UUIDs and the
-// NVLink matrix while it still owns the GPUs.
-func snapshotGPUs(ctx context.Context, cfg *config.Config) (gpuCache, error) {
-	c := loadGPUCache(cfg)
-	smi, err := exec.LookPath("nvidia-smi")
-	if err != nil {
-		return c, nil
+// gpuInfo is a vendor's host-side tool, run while the host driver still owns
+// the GPUs.
+type gpuInfo interface {
+	// snapshot records in c what the tool says about each GPU it sees. It
+	// reports false when the tool is missing or sees no GPU, which leaves the
+	// cache as it was.
+	snapshot(ctx context.Context, c *gpuCache) bool
+}
+
+// smiTool finds and runs a vendor tool. The zero value uses the real system;
+// tests set the fields.
+type smiTool struct {
+	look func(file string) (string, error)
+	run  func(ctx context.Context, bin string, args ...string) ([]byte, error)
+}
+
+func (t smiTool) path(file string) (string, error) {
+	if t.look != nil {
+		return t.look(file)
 	}
-	out, err := exec.CommandContext(ctx, smi, "--query-gpu=pci.bus_id,name,memory.total,uuid", "--format=csv,noheader,nounits").Output()
+	return exec.LookPath(file)
+}
+
+func (t smiTool) output(ctx context.Context, bin string, args ...string) ([]byte, error) {
+	if t.run != nil {
+		return t.run(ctx, bin, args...)
+	}
+	return exec.CommandContext(ctx, bin, args...).Output()
+}
+
+// nvidiaSMI reads names, VRAM, UUIDs and the NVLink matrix from nvidia-smi.
+type nvidiaSMI struct{ smiTool }
+
+func (n nvidiaSMI) snapshot(ctx context.Context, c *gpuCache) bool {
+	smi, err := n.path("nvidia-smi")
 	if err != nil {
-		return c, nil // driver present but no GPU on it (already on vfio-pci)
+		return false
+	}
+	out, err := n.output(ctx, smi, "--query-gpu=pci.bus_id,name,memory.total,uuid", "--format=csv,noheader,nounits")
+	if err != nil {
+		return false // driver present but no GPU on it (already on vfio-pci)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		f := strings.Split(line, ",")
@@ -63,8 +95,94 @@ func snapshotGPUs(ctx context.Context, cfg *config.Config) (gpuCache, error) {
 		mib, _ := strconv.Atoi(strings.TrimSpace(f[2]))
 		c.GPUs[addr] = hw.Cached{Name: strings.TrimSpace(f[1]), VRAMGB: (mib + 512) / 1024, UUID: strings.TrimSpace(f[3])}
 	}
-	if t, err := exec.CommandContext(ctx, smi, "topo", "-m").Output(); err == nil {
+	if t, err := n.output(ctx, smi, "topo", "-m"); err == nil {
 		c.Topo = string(t)
+	}
+	return true
+}
+
+// habanaSMI reads names and VRAM from hl-smi, when the host has it. The query
+// and its output format are not verified against a real Gaudi host (see
+// GAUDI-NOTES.md): lines that don't start with a PCI address (a header, a
+// note) are skipped, and any failure leaves the cache as it was, so the GPU
+// keeps its pci.ids name and the labelled 128 GB fallback from hw.GPUs. hl-smi
+// gives no UUID here; one learned earlier is kept. c.Topo stays empty: Gaudi
+// scale-up is direct OAM-to-OAM links, not NVLink, and nothing reads it.
+type habanaSMI struct{ smiTool }
+
+func (h habanaSMI) snapshot(ctx context.Context, c *gpuCache) bool {
+	smi, err := h.path("hl-smi")
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, hlSMITimeout)
+	defer cancel()
+	out, err := h.output(ctx, smi, "--query-aip=bus_id,name,memory.total", "--format=csv,noheader,nounits")
+	if err != nil {
+		return false // driver gone from the GPUs (already on vfio-pci)
+	}
+	seen := false
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f := strings.Split(line, ",")
+		if len(f) != 3 {
+			continue
+		}
+		addr := normalizeBusID(strings.TrimSpace(f[0]))
+		if !hw.ValidPCIAddress(addr) {
+			continue
+		}
+		c.GPUs[addr] = hw.Cached{Name: strings.TrimSpace(f[1]), VRAMGB: memoryGB(f[2]), UUID: c.GPUs[addr].UUID}
+		seen = true
+	}
+	return seen
+}
+
+// hlSMITimeout bounds each hl-smi call: a hung Habana driver must not hang the
+// agent's start.
+const hlSMITimeout = 30 * time.Second
+
+// maxMemoryGB is the most a GPU's memory is believed to be (1 TiB): a larger
+// number from hl-smi is a parse problem or hostile output, not a card.
+const maxMemoryGB = 1024
+
+// memoryGB reads hl-smi's memory.total: MiB when it has no unit (nounits), GiB
+// or GB when it says so. 0 when unreadable, not finite, not positive or above
+// maxMemoryGB.
+func memoryGB(s string) int {
+	f := strings.Fields(s)
+	if len(f) == 0 {
+		return 0
+	}
+	n, err := strconv.ParseFloat(f[0], 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
+		return 0
+	}
+	gb := n / 1024
+	if len(f) > 1 && (f[1] == "GiB" || f[1] == "GB") {
+		gb = n
+	}
+	if gb > maxMemoryGB {
+		return 0
+	}
+	return int(gb + 0.5)
+}
+
+// snapshotGPUs asks the host's vendor tools (if any) for names, VRAM, UUIDs
+// and the NVLink matrix while the host drivers still own the GPUs.
+func snapshotGPUs(ctx context.Context, cfg *config.Config) (gpuCache, error) {
+	return snapshotWith(ctx, cfg, nvidiaSMI{}, habanaSMI{})
+}
+
+func snapshotWith(ctx context.Context, cfg *config.Config, tools ...gpuInfo) (gpuCache, error) {
+	c := loadGPUCache(cfg)
+	learned := false
+	for _, t := range tools {
+		if t.snapshot(ctx, &c) {
+			learned = true
+		}
+	}
+	if !learned {
+		return c, nil
 	}
 	if err := config.ClaimDataDir(cfg.DataDir, false); err != nil {
 		return c, err
@@ -80,6 +198,16 @@ func normalizeBusID(s string) string {
 		s = s[i-4:]
 	}
 	return s
+}
+
+// hasHabana reports whether any registered GPU is an Intel Gaudi module.
+func (h *host) hasHabana() bool {
+	for _, g := range h.gpus {
+		if g.Vendor == hw.VendorHabana {
+			return true
+		}
+	}
+	return false
 }
 
 // host implements agent.Host.
@@ -192,7 +320,7 @@ func (h *host) Topology() api.Topology {
 		Interconnect:  "unknown",
 		NVSwitchCount: len(h.nvswitches),
 		NVLinkMatrix:  h.cacheTopo,
-		PartialVMOK:   len(h.nvswitches) == 0,
+		PartialVMOK:   len(h.nvswitches) == 0 && !h.hasHabana(),
 		NICs:          h.sys.NICs(),
 		PrivateAddrs:  hw.PrivateAddrs(h.subnet),
 	}

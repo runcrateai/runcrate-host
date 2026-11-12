@@ -92,6 +92,43 @@ write_files:
       RestartSec=5
       [Install]
       WantedBy=multi-user.target
+  - path: /usr/local/sbin/runcrate-guest-cmdline
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Runcrate: the host may ask for extra kernel arguments in an SMBIOS OEM
+      # string, runcrate.kernel_args=... (set for Intel Gaudi VMs). Put them on
+      # the kernel command line once and reboot, before cloud-init runs the
+      # customer's launch script. A VM without the string is left alone.
+      set -eu
+      args=\$(cat /sys/firmware/dmi/entries/11-*/raw 2>/dev/null | tr '\\0' '\\n' | grep -a -o 'runcrate\\.kernel_args=.*' | head -n 1 | cut -d= -f2- || true)
+      [ -n "\$args" ] || exit 0
+      case "\$args" in *[!A-Za-z0-9=,._:/ -]*) exit 0 ;; esac
+      missing=""
+      for a in \$args; do
+        case " \$(cat /proc/cmdline) " in *" \$a "*) ;; *) missing=1 ;; esac
+      done
+      [ -n "\$missing" ] || exit 0
+      [ ! -e /var/lib/runcrate-guest-cmdline.done ] || exit 0
+      mkdir -p /etc/default/grub.d
+      printf 'GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT %s"\\n' "\$args" > /etc/default/grub.d/91-runcrate-guest.cfg
+      update-grub
+      : > /var/lib/runcrate-guest-cmdline.done
+      systemctl reboot
+  - path: /etc/systemd/system/runcrate-guest-cmdline.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Runcrate guest kernel arguments
+      DefaultDependencies=no
+      After=local-fs.target
+      Before=cloud-init-local.service sysinit.target
+      ConditionPathExistsGlob=/sys/firmware/dmi/entries/11-*/raw
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/runcrate-guest-cmdline
+      [Install]
+      WantedBy=sysinit.target
   - path: /root/provision.sh
     permissions: '0755'
     content: |
@@ -146,6 +183,7 @@ write_files:
       systemctl enable nvidia-fabricmanager
       # Spot reclaim notice: mirrored from the metadata server into a file.
       systemctl enable runcrate-reclaim-watch.service
+      systemctl enable runcrate-guest-cmdline.service
       # First-boot apt runs (the launch script) must not race unattended-upgrades.
       systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer || true
       apt-get purge -y unattended-upgrades || true

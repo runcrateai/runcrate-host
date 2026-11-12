@@ -2,12 +2,15 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +19,7 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 	"github.com/runcrateai/runcrate-host/internal/vm"
 )
 
@@ -119,6 +123,9 @@ type fakeVMs struct {
 	free       []int // FreeGPUs' answer when set
 	cleared    []int
 	held       map[int]bool
+	vendors    map[int]hw.Vendor       // GPUVendor's answer by index (none: no vendor recorded)
+	ephOutFor  func(gpus []int) []byte // a throwaway VM's output by its GPUs, when set
+	vmVendor   map[string]hw.Vendor    // VMVendor's answer by VM id
 }
 
 func newFakeVMs() *fakeVMs {
@@ -137,6 +144,12 @@ func (v *fakeVMs) Create(ctx context.Context, s vm.Spec) (string, error) {
 	}
 	v.vms[s.ID] = api.VMStatus{VMID: s.ID, State: "running", GPUIndexes: s.GPUIndexes}
 	return "running", nil
+}
+
+func (v *fakeVMs) VMVendor(id string) hw.Vendor {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.vmVendor[id]
 }
 
 func (v *fakeVMs) Destroy(ctx context.Context, id string) error {
@@ -177,6 +190,12 @@ func (v *fakeVMs) FreeGPUs(bool) []int {
 	return []int{0, 1}
 }
 
+func (v *fakeVMs) GPUVendor(i int) hw.Vendor {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.vendors[i]
+}
+
 func (v *fakeVMs) HeldGPUs() map[int]bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -204,6 +223,9 @@ func (v *fakeVMs) RunEphemeral(ctx context.Context, id, owner, image string, gpu
 	v.ephScript = append(v.ephScript, script)
 	v.ephGPUs = append(v.ephGPUs, append([]int{}, gpus...))
 	out, err := v.ephOut, v.ephErr
+	if v.ephOutFor != nil {
+		out = v.ephOutFor(gpus)
+	}
 	v.mu.Unlock()
 	if during != nil {
 		during(ctx, "10.254.0.2")
@@ -643,5 +665,310 @@ func TestBenchmarkLeavesOutGPUsTakenDuringTheDownload(t *testing.T) {
 				t.Fatalf("held %v cleared %v: gpu 1 belongs to the create", vms.held, vms.cleared)
 			}
 		})
+	}
+}
+
+// An NVIDIA-only host boots one benchmark VM, with the NVIDIA script and the
+// id it always had.
+func TestBenchmarkNvidiaOnlyHostIsUnchanged(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorNvidia, 1: hw.VendorNvidia}
+	vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true},{"ordinal":1,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(45, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(45)) > 0 })
+	if len(vms.ephemeral) != 1 || vms.ephemeral[0] != "bench-45" || len(vms.ephGPUs[0]) != 2 {
+		t.Fatalf("throwaway vms %v on gpus %v, want one, bench-45, on both", vms.ephemeral, vms.ephGPUs)
+	}
+	// Pinned to the production script as it was before Gaudi existed (a fixed
+	// sha256), not to a fresh call of the function under test.
+	sum := sha256.Sum256([]byte(vms.ephScript[0]))
+	if got := hex.EncodeToString(sum[:]); got != nvidiaBenchScriptSHA256 {
+		t.Fatalf("the NVIDIA benchmark script changed (sha256 %s):\n%s", got, vms.ephScript[0])
+	}
+}
+
+// nvidiaBenchScriptSHA256 is the sha256 of vm.BenchScript(vm.IsolationTargets{}),
+// the script an NVIDIA host runs, unchanged from before the Gaudi work.
+const nvidiaBenchScriptSHA256 = "e47f14a5e3e027e7cf0f263b334f8ca30d6edabaa14409ba190d15b27b00269f"
+
+// A fake host that knows its GPUs' UUIDs.
+type uuidHost struct {
+	fakeHost
+	uuids map[int]string
+}
+
+func (h uuidHost) GPUUUID(i int) string { return h.uuids[i] }
+
+// Gaudi GPUs get visibility_only only with a matched result from a run that
+// worked and saw at least one accelerator. A failed run, or a device with no
+// result (fewer accelerators seen than assigned), is a plain failure: nothing
+// passing, no visibility_only, no visible_count.
+func TestBenchmarkGaudiNotSeenIsAPlainFailure(t *testing.T) {
+	oneSeen := `{"ok":true,"gpus":[{"ordinal":0,"name":"Intel Gaudi 3 OAM","uuid":"%s","mem_ok":true,"matmul_ok":true}]}`
+	for _, tc := range []struct {
+		name      string
+		ephOut    string
+		ephErr    error
+		uuids     map[int]string
+		wantVis   []int // indexes with visibility_only
+		wantHeld  []int
+		wantError string
+	}{
+		{name: "the benchmark vm failed to run", ephErr: errors.New("qemu did not start"), wantError: "qemu did not start"},
+		{name: "the vm reported an error", ephOut: `{"ok":false,"error":"no Gaudi accelerator is visible in the VM","gpus":[]}`, wantError: "no Gaudi accelerator is visible"},
+		{name: "the vm said not ok", ephOut: `{"ok":false,"gpus":[{"ordinal":0,"name":"Intel Gaudi 3 OAM"},{"ordinal":1,"name":"Intel Gaudi 3 OAM"}]}`, wantHeld: []int{0, 1}},
+		{name: "fewer accelerators seen than assigned", ephOut: strings.Replace(oneSeen, "%s", "", 1), wantHeld: []int{0, 1}, wantError: "gpu not visible inside the benchmark vm"},
+		{name: "partial match", ephOut: strings.Replace(oneSeen, "%s", "AIP-1", 1), uuids: map[int]string{0: "AIP-0", 1: "AIP-1"}, wantVis: []int{1}, wantHeld: []int{0}, wantError: "gpu not visible inside the benchmark vm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			vms := newFakeVMs()
+			vms.vendors = map[int]hw.Vendor{0: hw.VendorHabana, 1: hw.VendorHabana}
+			vms.ephOut, vms.ephErr = []byte(tc.ephOut), tc.ephErr
+			a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+			if tc.uuids != nil {
+				a.Host = uuidHost{uuids: tc.uuids}
+			}
+			cp.queue(70, api.KindBenchmark, map[string]any{})
+			tickUntil(t, a, func() bool { return len(cp.resultsFor(70)) > 0 })
+			b := cp.benchmarks[0]
+			if len(b.GPUs) != 2 {
+				t.Fatalf("gpus = %+v", b.GPUs)
+			}
+			var vis []int
+			for _, g := range b.GPUs {
+				if g.MemOK || g.MatmulOK {
+					t.Errorf("gpu %d passes: %+v", g.Index, g)
+				}
+				if g.VisibilityOnly {
+					vis = append(vis, g.Index)
+					if g.VisibleCount != 1 {
+						t.Errorf("gpu %d visible_count = %d, want 1", g.Index, g.VisibleCount)
+					}
+					continue
+				}
+				if g.VisibleCount != 0 {
+					t.Errorf("gpu %d is a plain failure but has visible_count %d", g.Index, g.VisibleCount)
+				}
+				if raw, _ := json.Marshal(g); strings.Contains(string(raw), "visibility_only") || strings.Contains(string(raw), "visible_count") {
+					t.Errorf("gpu %d payload mentions visibility: %s", g.Index, raw)
+				}
+				if tc.wantError != "" && !strings.Contains(g.Error, tc.wantError) {
+					t.Errorf("gpu %d error = %q, want %q", g.Index, g.Error, tc.wantError)
+				}
+			}
+			if len(vis) != len(tc.wantVis) || (len(vis) == 1 && vis[0] != tc.wantVis[0]) {
+				t.Errorf("visibility_only on %v, want %v", vis, tc.wantVis)
+			}
+			// A plain failure is held like any GPU's: when the VM ran. A VM that
+			// did not run says nothing about the GPU.
+			held := []int{}
+			for i := range vms.held {
+				held = append(held, i)
+			}
+			if len(held) != len(tc.wantHeld) {
+				t.Errorf("held %v, want %v", held, tc.wantHeld)
+			}
+			for _, i := range tc.wantHeld {
+				if !vms.held[i] {
+					t.Errorf("gpu %d is not held: %v", i, held)
+				}
+			}
+			if len(vms.cleared) != 0 {
+				t.Errorf("cleared %v", vms.cleared)
+			}
+			m := cp.resultsFor(70)[0].Result.(map[string]any)
+			if got, _ := m["gpus_visibility_only"].(float64); int(got) != len(tc.wantVis) {
+				t.Errorf("gpus_visibility_only = %v, want %d", m["gpus_visibility_only"], len(tc.wantVis))
+			}
+		})
+	}
+}
+
+// A destroy that is retried after the VM's record is gone (a lost result, a
+// restart) still says "wiped": false for a Gaudi VM: the vendor was saved with
+// the first destroy, in the state file. A VM that can't be identified on a
+// host with Gaudi modules is not reported wiped either; an NVIDIA VM is.
+func TestDestroyRetryAfterTheRecordIsGone(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorHabana, 1: hw.VendorNvidia}
+	vms.vmVendor = map[string]hw.Vendor{"vm-g": hw.VendorHabana, "vm-n": hw.VendorNvidia}
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	a := newAgent(t, cp, vms, statePath)
+	wiped := func(a *Agent, id int64, vmID string) any {
+		cp.queue(id, api.KindDestroyVM, map[string]any{"vm_id": vmID, "reason": "customer"})
+		tickUntil(t, a, func() bool { return len(cp.resultsFor(id)) > 0 })
+		return cp.resultsFor(id)[0].Result.(map[string]any)["wiped"]
+	}
+	if got := wiped(a, 80, "vm-g"); got != false {
+		t.Fatalf("the Gaudi VM: wiped = %v", got)
+	}
+	if got := wiped(a, 81, "vm-n"); got != true {
+		t.Fatalf("the NVIDIA VM: wiped = %v", got)
+	}
+	// The records are gone now (the fake drops them as the real manager does).
+	vms.mu.Lock()
+	vms.vmVendor = map[string]hw.Vendor{}
+	vms.mu.Unlock()
+	if got := wiped(a, 82, "vm-g"); got != false {
+		t.Fatalf("retried destroy of the Gaudi VM: wiped = %v, want false", got)
+	}
+	if got := wiped(a, 83, "vm-n"); got != true {
+		t.Fatalf("retried destroy of the NVIDIA VM: wiped = %v, want true", got)
+	}
+	if got := wiped(a, 84, "vm-never-seen"); got != false {
+		t.Fatalf("an unknown VM on a host with a Gaudi: wiped = %v, want false", got)
+	}
+	// The vendor survives an agent restart: a new agent on the same state file.
+	a2 := newAgent(t, cp, vms, statePath)
+	if got := wiped(a2, 85, "vm-g"); got != false {
+		t.Fatalf("after a restart: wiped = %v, want false", got)
+	}
+	// On a host with no Gaudi module an unknown VM is reported wiped, as before,
+	// and its state file gains no destroyed-VM entries.
+	vms2 := newFakeVMs()
+	vms2.vmVendor = map[string]hw.Vendor{"vm-n": hw.VendorNvidia}
+	statePath2 := filepath.Join(t.TempDir(), "state.json")
+	a3 := newAgent(t, cp, vms2, statePath2)
+	if got := wiped(a3, 86, "vm-never-seen"); got != true {
+		t.Fatalf("an unknown VM on an NVIDIA host: wiped = %v, want true", got)
+	}
+	if got := wiped(a3, 87, "vm-n"); got != true {
+		t.Fatalf("an NVIDIA VM on an NVIDIA host: wiped = %v, want true", got)
+	}
+	if raw, _ := os.ReadFile(statePath2); strings.Contains(string(raw), `"destroyed"`) {
+		t.Fatalf("an NVIDIA-only host's state records destroyed VMs: %s", raw)
+	}
+	if raw, _ := os.ReadFile(statePath); !strings.Contains(string(raw), `"destroyed"`) {
+		t.Fatalf("the Gaudi host's state lacks the destroyed VMs: %s", raw)
+	}
+}
+
+// NVIDIA and Gaudi on one host: one benchmark VM per vendor, NVIDIA first and
+// alone with the isolation checks; every GPU is reported.
+func TestBenchmarkMixedHostBootsOneVMPerVendor(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.free = []int{0, 1, 2}
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorHabana, 1: hw.VendorNvidia, 2: hw.VendorNvidia}
+	vms.ephOutFor = func(gpus []int) []byte {
+		if len(gpus) == 1 {
+			return []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"Intel Gaudi 3 OAM","uuid":"","mem_ok":true,"matmul_ok":true}],"isolation":[{"name":"must-not-appear","ok":true,"detail":""}]}`)
+		}
+		return []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true},{"ordinal":1,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}],"isolation":[{"name":"egress","ok":true,"detail":"works"}]}`)
+	}
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(46, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(46)) > 0 })
+	if len(vms.ephemeral) != 2 || vms.ephemeral[0] != "bench-46" || vms.ephemeral[1] != "bench-46-intel-habana" {
+		t.Fatalf("throwaway vms = %v", vms.ephemeral)
+	}
+	if len(vms.ephGPUs[0]) != 2 || vms.ephGPUs[0][0] != 1 || vms.ephGPUs[0][1] != 2 || len(vms.ephGPUs[1]) != 1 || vms.ephGPUs[1][0] != 0 {
+		t.Fatalf("gpus per vm = %v, want [[1 2] [0]]", vms.ephGPUs)
+	}
+	if !strings.Contains(vms.ephScript[0], "nvidia-smi") || !strings.Contains(vms.ephScript[0], "must egress") {
+		t.Fatal("the first VM must run the NVIDIA script with the isolation checks")
+	}
+	if !strings.Contains(vms.ephScript[1], "gaudi_pci") || strings.Contains(vms.ephScript[1], "must egress") || strings.Contains(vms.ephScript[1], "nvidia-smi -L") {
+		t.Fatal("the second VM must run the Gaudi script without the isolation checks")
+	}
+	b := cp.benchmarks[0]
+	if len(b.GPUs) != 3 || b.GPUs[0].Index != 0 || b.GPUs[0].Name != "Intel Gaudi 3 OAM" || b.GPUs[1].UUID != "GPU-a" || b.GPUs[2].UUID != "GPU-b" {
+		t.Fatalf("gpus = %+v", b.GPUs)
+	}
+	if b.Isolation == nil || len(b.Isolation.Checks) != 1 || b.Isolation.Checks[0].Name != "egress" {
+		t.Fatalf("isolation = %+v, want only the first VM's checks", b.Isolation)
+	}
+	// The NVIDIA GPUs passed; the Gaudi module was only seen: not cleared, not held.
+	if got := append([]int{}, vms.cleared...); len(got) != 2 || len(vms.held) != 0 || got[0]+got[1] != 3 || got[0]*got[1] != 2 {
+		t.Fatalf("cleared %v held %v, want GPUs 1 and 2 cleared", vms.cleared, vms.held)
+	}
+	if g := b.GPUs[0]; g.MemOK || g.MatmulOK || !g.VisibilityOnly || g.VisibleCount != 1 {
+		t.Fatalf("the Gaudi module = %+v, want visibility only with nothing passing", g)
+	}
+	for _, g := range b.GPUs[1:] {
+		if g.VisibilityOnly || g.VisibleCount != 0 || !g.MemOK || !g.MatmulOK {
+			t.Fatalf("an NVIDIA GPU = %+v", g)
+		}
+	}
+}
+
+// Gaudi benchmark: even a VM that says mem_ok and matmul_ok are true gets them
+// reported as false, visibility_only is set by the agent, nothing is cleared
+// or held, and the GPUs are not in gpus_ok.
+func TestBenchmarkGaudiIsVisibilityOnly(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorHabana, 1: hw.VendorHabana}
+	vms.ephOut = []byte(`{"ok":true,"gpus":[
+		{"ordinal":0,"name":"Intel Gaudi 3 OAM","mem_ok":true,"matmul_ok":true,"mem_tested_gb":128,"matmul_tflops_fp16":900},
+		{"ordinal":1,"name":"Intel Gaudi 3 OAM","mem_ok":true,"matmul_ok":true}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(47, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(47)) > 0 })
+	b := cp.benchmarks[0]
+	if len(b.GPUs) != 2 {
+		t.Fatalf("gpus = %+v", b.GPUs)
+	}
+	for _, g := range b.GPUs {
+		if g.MemOK || g.MatmulOK || g.MemTestedGB != 0 || g.MatmulTFLOPSFP16 != 0 || !g.VisibilityOnly || g.VisibleCount != 2 {
+			t.Fatalf("gpu = %+v, want nothing passing, nothing tested, visibility_only with 2 visible", g)
+		}
+	}
+	if len(vms.cleared) != 0 || len(vms.held) != 0 {
+		t.Fatalf("cleared %v held %v: a visibility-only benchmark changes no hold", vms.cleared, vms.held)
+	}
+	r := cp.resultsFor(47)[0]
+	m := r.Result.(map[string]any)
+	if r.Status != "done" || m["gpus_ok"] != float64(0) || m["gpus"] != float64(2) || m["gpus_visibility_only"] != float64(2) {
+		t.Fatalf("result = %+v", r)
+	}
+	if raw, _ := json.Marshal(b.GPUs[0]); !strings.Contains(string(raw), `"visibility_only":true`) || !strings.Contains(string(raw), `"visible_count":2`) {
+		t.Fatalf("payload = %s", raw)
+	}
+}
+
+// NVIDIA payloads carry neither field, and an NVIDIA result has no
+// gpus_visibility_only: byte-identical to before.
+func TestBenchmarkNvidiaPayloadHasNoVisibilityFields(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vendors = map[int]hw.Vendor{0: hw.VendorNvidia, 1: hw.VendorNvidia}
+	vms.ephOut = []byte(`{"ok":true,"gpus":[{"ordinal":0,"name":"H100","uuid":"GPU-a","vram_gb":80,"mem_ok":true,"matmul_ok":true},{"ordinal":1,"name":"H100","uuid":"GPU-b","vram_gb":80,"mem_ok":true,"matmul_ok":true}]}`)
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	cp.queue(48, api.KindBenchmark, map[string]any{})
+	tickUntil(t, a, func() bool { return len(cp.resultsFor(48)) > 0 })
+	raw, err := json.Marshal(cp.benchmarks[0])
+	if err != nil || strings.Contains(string(raw), "visib") {
+		t.Fatalf("NVIDIA benchmark payload mentions visibility: %s (%v)", raw, err)
+	}
+	if _, has := cp.resultsFor(48)[0].Result.(map[string]any)["gpus_visibility_only"]; has {
+		t.Fatal("an NVIDIA result carries gpus_visibility_only")
+	}
+	if len(vms.cleared) != 2 {
+		t.Fatalf("cleared %v", vms.cleared)
+	}
+}
+
+// destroy_vm says what the host knows: a Gaudi VM's GPUs are not wiped.
+func TestDestroyVMWipedIsTruthful(t *testing.T) {
+	cp := newFakeCP(t)
+	vms := newFakeVMs()
+	vms.vmVendor = map[string]hw.Vendor{"vm-g": hw.VendorHabana, "vm-n": hw.VendorNvidia}
+	a := newAgent(t, cp, vms, filepath.Join(t.TempDir(), "state.json"))
+	for i, id := range []string{"vm-g", "vm-n", "vm-unknown"} {
+		cp.queue(int64(60+i), api.KindDestroyVM, map[string]any{"vm_id": id, "reason": "customer"})
+	}
+	tickUntil(t, a, func() bool {
+		return len(cp.resultsFor(60)) > 0 && len(cp.resultsFor(61)) > 0 && len(cp.resultsFor(62)) > 0
+	})
+	for id, want := range map[int64]bool{60: false, 61: true, 62: true} {
+		m, _ := cp.resultsFor(id)[0].Result.(map[string]any)
+		if got, ok := m["wiped"].(bool); !ok || got != want {
+			t.Errorf("command %d: wiped = %v, want %v (%+v)", id, m["wiped"], want, m)
+		}
 	}
 }

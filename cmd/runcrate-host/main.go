@@ -192,7 +192,10 @@ func bindGPUs(cfg *config.Config) error {
 	return errors.Join(errs...)
 }
 
-// releaseGPUs gives every NVIDIA function on vfio-pci back to the host.
+// releaseGPUs gives every NVIDIA and Intel Gaudi function on vfio-pci back to the host.
+// "Every" is meant: any function of a GPU vendor (10de, 1da3) bound to vfio-pci
+// is released, accelerator or not (a Habana NIC or management function the
+// boot-time ids= line claimed goes back too).
 func releaseGPUs(cfg *config.Config) error {
 	devs, err := hw.Host.Devices()
 	if err != nil {
@@ -201,7 +204,7 @@ func releaseGPUs(cfg *config.Config) error {
 	var errs []error
 	sys := vfio.Sysfs{Root: "/"}
 	for _, d := range devs {
-		if d.Vendor == hw.NvidiaVendor && d.Driver == vfio.Driver {
+		if hw.IsGPUVendor(d.Vendor) && d.Driver == vfio.Driver {
 			if err := sys.Release(d.Address); err != nil {
 				errs = append(errs, err)
 			}
@@ -215,7 +218,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	tokenFile := fs.String("token-file", "", "file holding the registration token, readable by its owner only (- for stdin)")
 	name := fs.String("name", "", "host name shown to you in Runcrate (default: hostname)")
 	site := fs.String("site", "", "site name, to group hosts in one location")
-	gpus := fs.String("gpus", "", "comma-separated PCI addresses to give Runcrate (default: every NVIDIA GPU)")
+	gpus := fs.String("gpus", "", "comma-separated PCI addresses to give Runcrate (default: every NVIDIA or Intel Gaudi GPU)")
 	dataDir := fs.String("data-dir", "", "where VM disks and images live (default /var/lib/runcrate-host)")
 	apiURL := fs.String("api", "", "host API base URL (default production)")
 	if err := fs.Parse(args); err != nil {
@@ -284,7 +287,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 			why = append(why, g.Address+": "+g.Blocker)
 		}
 		if len(why) == 0 {
-			return errors.New("no NVIDIA GPUs found")
+			return errors.New("no NVIDIA or Intel Gaudi GPUs found")
 		}
 		return fmt.Errorf("no GPU can be passed through:\n  %s", strings.Join(why, "\n  "))
 	}
@@ -322,7 +325,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	}
 	models := map[string]bool{}
 	for _, g := range list {
-		req.Host.GPUs = append(req.Host.GPUs, api.RegisterGPU{Index: g.Index, ModelRaw: g.ModelRaw, VRAMGB: g.VRAMGB, UUID: g.UUID, PCIeAddress: g.Address})
+		req.Host.GPUs = append(req.Host.GPUs, registerGPU(g))
 		models[g.ModelRaw] = true
 	}
 	req.Host.Specs.GPUs.Count = len(list)
@@ -414,6 +417,18 @@ func currentUser() string {
 		return u.Username
 	}
 	return "uid " + fmt.Sprint(os.Geteuid())
+}
+
+// registerGPU is a GPU as the registration payload carries it. An Intel Gaudi
+// also reports its kernel reset_method ("" when it has none), for staff to see
+// when approving; an NVIDIA GPU's entry is exactly what it always was.
+func registerGPU(g hw.GPU) api.RegisterGPU {
+	r := api.RegisterGPU{Index: g.Index, ModelRaw: g.ModelRaw, VRAMGB: g.VRAMGB, UUID: g.UUID, PCIeAddress: g.Address}
+	if g.Vendor == hw.VendorHabana {
+		m := g.ResetMethod
+		r.ResetMethod = &m
+	}
+	return r
 }
 
 // registerRequestID is stable until registration succeeds, so a retry after
@@ -635,6 +650,9 @@ func cmdStatus(ctx context.Context, dir string) error {
 		line := fmt.Sprintf("  %d  %s  %-40s driver=%s health=%s", g.Index, g.Address, g.ModelRaw, orDash(d.Driver), hw.Host.Health(g.Address))
 		if g.Blocker != "" {
 			line += "  BLOCKED: " + g.Blocker
+		}
+		if g.Vendor == hw.VendorHabana && g.ResetMethod == "" {
+			line += "  WARN: no reset method (not reset between tenants; see GAUDI-NOTES.md)"
 		}
 		fmt.Println(line)
 	}

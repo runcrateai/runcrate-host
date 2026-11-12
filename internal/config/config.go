@@ -196,7 +196,7 @@ func ClaimDataDir(dir string, migrate bool) error {
 		ours = ours || name == "state.json" || name == "gpus-cache.json"
 	}
 	// Without agent state (gpus-cache.json, written at registration when the
-	// host has an NVIDIA driver, or state.json, after the first command),
+	// host has a vendor GPU tool (nvidia-smi, hl-smi), or state.json, after the first command),
 	// folders named like ours aren't proof the agent made them.
 	if others && !ours {
 		return fmt.Errorf("data directory %s has no agent state (gpus-cache.json or state.json): give runcrate-host a new or empty directory (--data-dir)", dir)

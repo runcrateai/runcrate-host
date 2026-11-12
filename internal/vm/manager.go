@@ -441,6 +441,44 @@ func (m *Manager) gpu(idx int) (hw.GPU, bool) {
 	return hw.GPU{}, false
 }
 
+// vendorOf is the vendor of the GPUs of a VM ("" when none is known): claim
+// keeps one VM to one vendor.
+func (m *Manager) vendorOf(gpus []int) hw.Vendor {
+	for _, g := range gpus {
+		if gpu, ok := m.gpu(g); ok {
+			return gpu.Vendor
+		}
+	}
+	return ""
+}
+
+// GPUVendor is the vendor of one registered GPU ("" when the index is unknown).
+func (m *Manager) GPUVendor(idx int) hw.Vendor { return m.vendorOf([]int{idx}) }
+
+// VMVendor is the GPU vendor of a VM on this host ("" when it has no GPUs or
+// isn't here).
+func (m *Manager) VMVendor(id string) hw.Vendor {
+	m.mu.Lock()
+	r, ok := m.vms[id]
+	m.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	return m.vendorOf(r.GPUIndexes)
+}
+
+// vendorCount is how many of the host's GPUs belong to the vendor v is (a GPU
+// with no vendor recorded is NVIDIA).
+func (m *Manager) vendorCount(v hw.Vendor) int {
+	n := 0
+	for _, g := range m.GPUs {
+		if (g.Vendor == hw.VendorHabana) == (v == hw.VendorHabana) {
+			n++
+		}
+	}
+	return n
+}
+
 // ErrCapacity means the host can't fit the VM.
 var ErrCapacity = errors.New("not enough capacity on this host")
 
@@ -454,6 +492,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		return nil, false, fmt.Errorf("vcpus and ram_gb must be positive")
 	}
 	seen := map[int]bool{}
+	var vendor hw.Vendor
 	for _, g := range s.GPUIndexes {
 		gpu, ok := m.gpu(g)
 		if !ok {
@@ -465,10 +504,19 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 		if seen[g] {
 			return nil, false, fmt.Errorf("gpu index %d listed twice", g)
 		}
+		if len(seen) > 0 && gpu.Vendor != vendor {
+			return nil, false, fmt.Errorf("gpu %d is %q but the VM's other GPUs are %q: one VM takes GPUs of one vendor", g, gpu.Vendor, vendor)
+		}
+		vendor = gpu.Vendor
 		seen[g] = true
 	}
-	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != len(m.GPUs) {
-		return nil, false, fmt.Errorf("this is an NVSwitch node: a VM must take all %d GPUs", len(m.GPUs))
+	if vendor == hw.VendorHabana && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != m.vendorCount(hw.VendorHabana) {
+		// The OAM modules are linked to each other on the baseboard, so a
+		// VM that held some would sit next to modules another tenant holds.
+		return nil, false, fmt.Errorf("this is a Gaudi baseboard: a VM must take all %d Gaudi modules", m.vendorCount(hw.VendorHabana))
+	}
+	if len(m.NVSwitches) > 0 && vendor != hw.VendorHabana && len(s.GPUIndexes) > 0 && len(s.GPUIndexes) != m.vendorCount(vendor) {
+		return nil, false, fmt.Errorf("this is an NVSwitch node: a VM must take all %d GPUs", m.vendorCount(vendor))
 	}
 	deadline := time.Now().Add(15 * time.Minute)
 	for {
@@ -560,7 +608,7 @@ func (m *Manager) claim(ctx context.Context, s Spec) (*Record, bool, error) {
 			r.PassThrough = append(r.PassThrough, gpu.Address)
 		}
 	}
-	if len(m.NVSwitches) > 0 && len(s.GPUIndexes) == len(m.GPUs) && !m.NoPassthrough {
+	if len(m.NVSwitches) > 0 && vendor != hw.VendorHabana && len(s.GPUIndexes) == m.vendorCount(vendor) && !m.NoPassthrough {
 		r.PassThrough = append(r.PassThrough, m.NVSwitches...)
 	}
 	m.vms[s.ID] = r
@@ -715,6 +763,7 @@ func (m *Manager) start(ctx context.Context, r *Record) error {
 		Tap: r.Tap, MAC: r.MAC, Firmware: m.Firmware, PassThrough: r.PassThrough,
 		MMIO64MB: MMIO64For(m.Sys.Root, r.PassThrough),
 	}
+	spec.ForVendor(m.vendorOf(r.GPUIndexes))
 	if filepath.Dir(spec.Base) != filepath.Join(m.DataDir, "images") {
 		return fmt.Errorf("vm %s has no valid base image (%q)", r.ID, spec.Base)
 	}
@@ -930,7 +979,20 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return nil
 	}
 	gpus := append([]int{}, r.GPUIndexes...)
-	scrub := m.Scrub && !r.Ephemeral && r.Started && len(gpus) > 0
+	customer := !r.Ephemeral && r.Started && len(gpus) > 0
+	scrub := m.Scrub && customer
+	if customer && !scrub && m.vendorOf(gpus) == hw.VendorHabana {
+		// A Gaudi can't be wiped here (no scrub VM runs, or it runs and fails:
+		// see GaudiScrubScript), so its modules are held back after every
+		// customer VM, whatever the partner set scrub_gpus to. The hold is
+		// persisted now, before anything else can change: if a marker can't be
+		// written the destroy stops here (the VM stays recorded and running), or
+		// a restart would forget the hold and free unwiped modules.
+		if err := m.holdDurably(gpus); err != nil {
+			return fmt.Errorf("gaudi modules can't be held back, vm %s not destroyed: %w", id, err)
+		}
+		m.Log.Warn("gaudi modules held back after a customer vm: their memory is not wiped", "vm", id, "gpus", gpus)
+	}
 	if scrub {
 		// Remember the scrub before anything else, so a crash or restart at
 		// any point still does it.
@@ -1034,7 +1096,22 @@ func (m *Manager) startScrub(id string, gpus []int) {
 // benchmark.
 func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 	owner := "scrub:" + after
-	m.Hold(gpus)
+	habana := m.vendorOf(gpus) == hw.VendorHabana
+	if habana {
+		m.Log.Warn("gaudi scrub only checks the accelerators reached the VM: their memory is not overwritten", "after", after, "gpus", gpus)
+	}
+	heldOnDisk := true
+	if habana {
+		if herr := m.holdDurably(gpus); herr != nil {
+			// Held in memory only for now; the scrub marker stays until the
+			// hold is on disk, so a restart redoes the scrub and holds again.
+			heldOnDisk = false
+			m.Log.Error("gaudi hold marker not written", "after", after, "gpus", gpus, "err", herr)
+			m.Hold(gpus)
+		}
+	} else {
+		m.Hold(gpus)
+	}
 	m.mu.Lock()
 	for _, g := range gpus {
 		m.busy[g] = owner
@@ -1053,7 +1130,7 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		id := fmt.Sprintf("scrub-%s-%d", hex.EncodeToString(hash(after))[:10], time.Now().UnixNano()%1e9)
 		rctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		var out []byte
-		out, _, err = m.RunEphemeral(rctx, id, owner, "", gpus, ScrubScript, 15*time.Minute, nil)
+		out, _, err = m.RunEphemeral(rctx, id, owner, "", gpus, ScrubScriptFor(m.vendorOf(gpus)), 15*time.Minute, nil)
 		cancel()
 		if ctx.Err() != nil {
 			return // shutting down: marker kept
@@ -1075,9 +1152,11 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 		}
 	}
 	m.mu.Unlock()
-	_ = os.Remove(m.scrubMarker(after))
+	if !(err != nil && habana && !heldOnDisk && m.holdDurably(gpus) != nil) {
+		_ = os.Remove(m.scrubMarker(after))
+	}
 	if err != nil {
-		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes", "after", after, "gpus", gpus, "err", err)
+		m.Log.Error("gpu scrub failed; gpus held back until a benchmark passes (Gaudi: until the box test and a manual clear)", "after", after, "gpus", gpus, "err", err)
 	}
 }
 
@@ -1085,8 +1164,9 @@ func (m *Manager) scrub(ctx context.Context, after string, gpus []int) {
 // when the host knows it: a GPU missing from the VM was not wiped.
 func (m *Manager) checkScrub(out []byte, gpus []int) error {
 	var res struct {
-		OK   bool `json:"ok"`
-		GPUs []struct {
+		OK    bool  `json:"ok"`
+		Wiped *bool `json:"wiped"`
+		GPUs  []struct {
 			UUID string `json:"uuid"`
 			OK   bool   `json:"ok"`
 		} `json:"gpus"`
@@ -1094,6 +1174,16 @@ func (m *Manager) checkScrub(out []byte, gpus []int) error {
 	}
 	if err := json.Unmarshal(out, &res); err != nil {
 		return fmt.Errorf("scrub output: %w", err)
+	}
+	// An explicit "wiped": false is a failure for every vendor. An Intel Gaudi
+	// result must also say "wiped": true: the Gaudi scrub script can't
+	// overwrite HBM (no Intel software is bundled), so a result that doesn't
+	// claim a wipe is not one. NVIDIA results that omit it stay accepted.
+	if res.Wiped != nil && !*res.Wiped {
+		return fmt.Errorf("scrub did not wipe the GPU memory (wiped: false)")
+	}
+	if res.Wiped == nil && m.vendorOf(gpus) == hw.VendorHabana {
+		return fmt.Errorf("scrub result does not say the GPU memory was wiped")
 	}
 	if !res.OK {
 		return fmt.Errorf("scrub reported failure: %s", truncate(res.Error, 300))
@@ -1112,6 +1202,37 @@ func (m *Manager) checkScrub(out []byte, gpus []int) error {
 		if gpu, ok := m.gpu(idx); ok && gpu.UUID != "" && !seen[strings.ToLower(gpu.UUID)] {
 			return fmt.Errorf("gpu %d (%s) was not in the scrub", idx, gpu.UUID)
 		}
+	}
+	return nil
+}
+
+// holdDurably is Hold for Intel Gaudi modules, whose hold must outlive a
+// restart: it reports a marker that can't be written instead of logging it,
+// and then changes nothing (markers it created are removed, no GPU is marked
+// held in memory). Hold itself still only logs.
+func (m *Manager) holdDurably(gpus []int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.init()
+	if err := os.MkdirAll(filepath.Join(m.DataDir, "holds"), 0o700); err != nil {
+		return fmt.Errorf("holds directory: %w", err)
+	}
+	var created []string
+	for _, g := range gpus {
+		p := m.holdPath(g)
+		_, statErr := os.Stat(p)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			for _, c := range created {
+				_ = os.Remove(c)
+			}
+			return fmt.Errorf("hold marker for gpu %d: %w", g, err)
+		}
+		if statErr != nil {
+			created = append(created, p)
+		}
+	}
+	for _, g := range gpus {
+		m.scrubOK[g] = false
 	}
 	return nil
 }

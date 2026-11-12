@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/runcrateai/runcrate-host/internal/api"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 	"github.com/runcrateai/runcrate-host/internal/release"
 	"github.com/runcrateai/runcrate-host/internal/vm"
 )
@@ -33,6 +35,10 @@ type VMs interface {
 	Reclaim(id string, deadline time.Time) error
 	List(ctx context.Context) []api.VMStatus
 	FreeGPUs(withHeld bool) []int
+	// GPUVendor is the vendor of a registered GPU, from its record.
+	GPUVendor(index int) hw.Vendor
+	// VMVendor is the GPU vendor of a VM on this host ("" when unknown).
+	VMVendor(id string) hw.Vendor
 	HeldGPUs() map[int]bool
 	ClearHold(gpus []int)
 	Hold(gpus []int)
@@ -329,6 +335,41 @@ func (a *Agent) reportUpdate() {
 	})
 }
 
+// hostHasHabana reports whether any registered GPU on this host is an Intel
+// Gaudi module, from the GPU records.
+func (a *Agent) hostHasHabana() bool {
+	for _, g := range a.Host.GPUs() {
+		if a.VMs.GPUVendor(g.Index) == hw.VendorHabana {
+			return true
+		}
+	}
+	return false
+}
+
+// destroyVendor is the GPU vendor of the VM about to be destroyed: from its
+// record, else from what an earlier destroy of it remembered (a retry after
+// the record is gone). On a host with Gaudi modules a known vendor is saved in
+// the state first, so a destroy that is retried after a crash or a lost result
+// still reports whose GPUs they were. "" when unknown.
+func (a *Agent) destroyVendor(id string) hw.Vendor {
+	if v := a.VMs.VMVendor(id); v != "" {
+		if a.hostHasHabana() {
+			if err := a.State.update(func(s *State) {
+				if s.Destroyed == nil {
+					s.Destroyed = map[string]DestroyedVM{}
+				}
+				s.Destroyed[id] = DestroyedVM{Vendor: v, At: time.Now()}
+			}); err != nil {
+				a.Log.Error("save destroyed vm vendor", "vm", id, "err", err)
+			}
+		}
+		return v
+	}
+	var d DestroyedVM
+	a.State.view(func(s *State) { d = s.Destroyed[id] })
+	return d.Vendor
+}
+
 func (a *Agent) lock(key string) func() {
 	a.mu.Lock()
 	l, ok := a.locks[key]
@@ -386,10 +427,17 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 			return nil, fmt.Errorf("bad vm_id %q", p.VMID)
 		}
 		defer a.lock("vm:" + p.VMID)()
+		vendor := a.destroyVendor(p.VMID)
 		if err := a.VMs.Destroy(ctx, p.VMID); err != nil {
 			return nil, err
 		}
-		return map[string]any{"vm_id": p.VMID, "wiped": true}, nil
+		// "wiped" is what the host knows. True only for a VM positively
+		// identified as NVIDIA (or, on a host with no Gaudi module, one whose
+		// record is already gone: nothing there can be a Gaudi's). The Gaudi
+		// scrub can't overwrite memory (see vm.GaudiScrubScript), and a VM that
+		// can't be identified on a host with Gaudi modules might have been one.
+		wiped := vendor == hw.VendorNvidia || (vendor == "" && !a.hostHasHabana())
+		return map[string]any{"vm_id": p.VMID, "wiped": wiped}, nil
 
 	case api.KindReclaimNotice:
 		p, err := decode[api.ReclaimNotice](c.Payload)
@@ -508,6 +556,7 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	sort.Ints(free)
 	var gpuErr string
 	var passed, failed []int
+	visibilityOnly := 0
 	if len(free) > 0 && p.ImageVersion != "" && a.Images != nil {
 		// Fetch the image before the VM takes the GPUs, so a multi-GB
 		// download doesn't hold them. Without it nothing boots: every GPU is
@@ -540,52 +589,95 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		// The tunnel gateways are checked even without the host-side checks:
 		// customers reach their VMs through them.
 		targets.TunnelGateways = vm.TunnelGatewaysFrom(p.Gateways)
-		out, image, err := a.VMs.RunEphemeral(ctx, "bench-"+strconv.FormatInt(cmdID, 10), "", p.ImageVersion, free, vm.BenchScript(targets), 30*time.Minute, during)
-		if a.Images != nil && image != "" {
-			req.Image = a.Images.Checked(image)
-		}
-		var vb vmBench
-		switch {
-		case err != nil:
-			gpuErr = err.Error()
-		case json.Unmarshal(out, &vb) != nil:
-			gpuErr = "benchmark vm returned unreadable output"
-		}
-		if vb.Error != "" {
-			gpuErr = vb.Error
-		}
-		if checks := isolationChecks(vb.Isolation, lan); len(checks) > 0 {
-			req.Isolation = &api.Isolation{Checks: checks}
-		}
-		if a.DevGPUs != nil && err == nil {
-			// The VM booted and ran the script; there are no GPUs in it.
-			gpuErr, vb.GPUs = "", nil
-			for _, idx := range free {
-				name, uuid, vram := a.DevGPUs(idx)
-				vb.GPUs = append(vb.GPUs, vmGPU{Ordinal: len(vb.GPUs), Name: name, UUID: uuid, VRAMGB: float64(vram),
-					MemOK: true, MatmulOK: true, NvidiaSMI: "devnopassthrough: not measured"})
+		// One VM takes GPUs of one vendor, so a host with several gets one
+		// benchmark VM per vendor (NVIDIA first). Only the first runs the
+		// isolation checks and their LAN probe: they describe the VM network.
+		firstErr := ""
+		for gi, group := range a.byVendor(free) {
+			free, gpuErr := group.gpus, ""
+			id, groupDuring := "bench-"+strconv.FormatInt(cmdID, 10), during
+			if gi > 0 {
+				id, groupDuring = id+"-"+string(group.vendor), nil
 			}
-		}
-		for idx, v := range a.matchGPUs(free, vb.GPUs) {
-			g := api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr}
-			if v != nil {
-				g = api.BenchmarkGPU{
-					Index: idx, Name: v.Name, UUID: v.UUID, VRAMGB: int(v.VRAMGB + 0.5), PCIeAddress: a.Host.GPUAddress(idx),
-					MemOK: v.MemOK, MemTestedGB: v.MemTestedGB, MatmulTFLOPSFP16: v.MatmulTFLOPSFP16, MatmulOK: v.MatmulOK,
-					NvidiaSMI: clip(v.NvidiaSMI, smiCap(len(free))), Error: clip(v.Error, 500),
-				}
-			} else if gpuErr == "" {
-				g.Error = "gpu not visible inside the benchmark vm"
+			out, image, err := a.VMs.RunEphemeral(ctx, id, "", p.ImageVersion, free, vm.BenchScriptFor(group.vendor, targets, gi == 0), 30*time.Minute, groupDuring)
+			if a.Images != nil && image != "" {
+				req.Image = a.Images.Checked(image)
 			}
+			var vb vmBench
 			switch {
-			case g.MemOK && g.MatmulOK:
-				passed = append(passed, idx)
-			case gpuErr == "":
-				// The VM ran and this GPU failed its checks (not a boot or
-				// image problem, which says nothing about the GPU).
-				failed = append(failed, idx)
+			case err != nil:
+				gpuErr = err.Error()
+			case json.Unmarshal(out, &vb) != nil:
+				gpuErr = "benchmark vm returned unreadable output"
 			}
-			req.GPUs = append(req.GPUs, g)
+			if vb.Error != "" {
+				gpuErr = vb.Error
+			}
+			if checks := isolationChecks(vb.Isolation, lan); gi == 0 && len(checks) > 0 {
+				req.Isolation = &api.Isolation{Checks: checks}
+			}
+			if a.DevGPUs != nil && err == nil {
+				// The VM booted and ran the script; there are no GPUs in it.
+				gpuErr, vb.GPUs = "", nil
+				for _, idx := range free {
+					name, uuid, vram := a.DevGPUs(idx)
+					vb.GPUs = append(vb.GPUs, vmGPU{Ordinal: len(vb.GPUs), Name: name, UUID: uuid, VRAMGB: float64(vram),
+						MemOK: true, MatmulOK: true, NvidiaSMI: "devnopassthrough: not measured"})
+				}
+			}
+			for idx, v := range a.matchGPUs(free, vb.GPUs) {
+				g := api.BenchmarkGPU{Index: idx, PCIeAddress: a.Host.GPUAddress(idx), Error: gpuErr}
+				if v != nil {
+					g = api.BenchmarkGPU{
+						Index: idx, Name: v.Name, UUID: v.UUID, VRAMGB: int(v.VRAMGB + 0.5), PCIeAddress: a.Host.GPUAddress(idx),
+						MemOK: v.MemOK, MemTestedGB: v.MemTestedGB, MatmulTFLOPSFP16: v.MatmulTFLOPSFP16, MatmulOK: v.MatmulOK,
+						NvidiaSMI: clip(v.NvidiaSMI, smiCap(len(free))), Error: clip(v.Error, 500),
+					}
+				} else if gpuErr == "" {
+					g.Error = "gpu not visible inside the benchmark vm"
+				}
+				if group.vendor == hw.VendorHabana {
+					// The VM only counted the accelerators: nothing was tested, so
+					// nothing passes (mem_ok and matmul_ok are false whatever the
+					// script said).
+					g.MemOK, g.MatmulOK, g.MemTestedGB, g.MatmulTFLOPSFP16 = false, false, 0, 0
+					if v != nil && gpuErr == "" && (vb.OK || a.DevGPUs != nil) && len(vb.GPUs) >= 1 {
+						// This device has a matched result from a successful run that
+						// saw at least one accelerator: visibility only. It is neither
+						// passed nor failed (the hold state is left as it is), and the
+						// control plane decides: a Gaudi GPU is "pending manual" until
+						// the on-box tests are done.
+						g.VisibilityOnly, g.VisibleCount = true, len(vb.GPUs)
+						visibilityOnly++
+						req.GPUs = append(req.GPUs, g)
+						continue
+					}
+					// A failed run, or no result for this device (fewer
+					// accelerators seen than assigned): a plain failure like any
+					// other GPU's, with no visibility_only and no visible_count.
+				}
+				switch {
+				case g.MemOK && g.MatmulOK:
+					passed = append(passed, idx)
+				case gpuErr == "":
+					// The VM ran and this GPU failed its checks (not a boot or
+					// image problem, which says nothing about the GPU).
+					failed = append(failed, idx)
+				}
+				req.GPUs = append(req.GPUs, g)
+			}
+			if vb.Topo != "" {
+				topo.NVLinkMatrix = clip(vb.Topo, maxTopo)
+				if topo.Interconnect != "nvswitch" {
+					topo.Interconnect = interconnectFrom(vb.Topo)
+				}
+			}
+			if firstErr == "" {
+				firstErr = gpuErr
+			}
+		}
+		if gpuErr == "" {
+			gpuErr = firstErr
 		}
 		sort.Slice(req.GPUs, func(i, j int) bool { return req.GPUs[i].Index < req.GPUs[j].Index })
 		learned := map[int]string{}
@@ -596,12 +688,6 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		}
 		if len(learned) > 0 {
 			a.Host.LearnUUIDs(learned)
-		}
-		if vb.Topo != "" {
-			topo.NVLinkMatrix = clip(vb.Topo, maxTopo)
-			if topo.Interconnect != "nvswitch" {
-				topo.Interconnect = interconnectFrom(vb.Topo)
-			}
 		}
 	}
 	wg.Wait()
@@ -627,7 +713,7 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 	if err != nil {
 		return nil, fmt.Errorf("post benchmark: %w", err)
 	}
-	return map[string]any{
+	res := map[string]any{
 		"verified": resp.Verified,
 		"reasons":  resp.Reasons,
 		"gpus":     len(req.GPUs),
@@ -635,7 +721,12 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 		"disk":     req.Disk,
 		"net":      req.Net,
 		"error":    gpuErr,
-	}, nil
+	}
+	if visibilityOnly > 0 {
+		// Gaudi GPUs the benchmark only saw, not tested: not in gpus_ok.
+		res["gpus_visibility_only"] = visibilityOnly
+	}
+	return res, nil
 }
 
 // Size caps keep a benchmark well under the control plane's 64 KiB body
@@ -657,6 +748,42 @@ func clip(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// vendorGPUs are the GPU indexes of one vendor.
+type vendorGPUs struct {
+	vendor hw.Vendor
+	gpus   []int
+}
+
+// byVendor splits GPU indexes (in index order) by vendor, from the GPU
+// records: NVIDIA, or no vendor recorded, first, then the others by name.
+func (a *Agent) byVendor(idx []int) []vendorGPUs {
+	var groups []vendorGPUs
+	for _, i := range idx {
+		v := a.VMs.GPUVendor(i)
+		if v == "" {
+			v = hw.VendorNvidia
+		}
+		n := slices.IndexFunc(groups, func(g vendorGPUs) bool { return g.vendor == v })
+		if n < 0 {
+			groups = append(groups, vendorGPUs{vendor: v})
+			n = len(groups) - 1
+		}
+		groups[n].gpus = append(groups[n].gpus, i)
+	}
+	slices.SortStableFunc(groups, func(x, y vendorGPUs) int {
+		switch {
+		case x.vendor == y.vendor:
+			return 0
+		case x.vendor == hw.VendorNvidia:
+			return -1
+		case y.vendor == hw.VendorNvidia:
+			return 1
+		}
+		return strings.Compare(string(x.vendor), string(y.vendor))
+	})
+	return groups
 }
 
 // matchGPUs pairs each benchmarked index with its result: by UUID when the
