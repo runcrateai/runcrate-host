@@ -979,7 +979,16 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return nil
 	}
 	gpus := append([]int{}, r.GPUIndexes...)
-	scrub := m.Scrub && !r.Ephemeral && r.Started && len(gpus) > 0
+	customer := !r.Ephemeral && r.Started && len(gpus) > 0
+	scrub := m.Scrub && customer
+	if customer && !scrub && m.vendorOf(gpus) == hw.VendorHabana {
+		// A Gaudi can't be wiped here (no scrub VM runs, or it runs and fails:
+		// see GaudiScrubScript), so its modules are held back after every
+		// customer VM, whatever the partner set scrub_gpus to. The hold is
+		// persisted now, before anything else can fail.
+		m.Hold(gpus)
+		m.Log.Warn("gaudi modules held back after a customer vm: their memory is not wiped", "vm", id, "gpus", gpus)
+	}
 	if scrub {
 		// Remember the scrub before anything else, so a crash or restart at
 		// any point still does it.

@@ -28,6 +28,11 @@ type RegisterGPU struct {
 	VRAMGB      int    `json:"vram_gb"`
 	UUID        string `json:"uuid"`
 	PCIeAddress string `json:"pcie_address"`
+	// ResetMethod is the kernel's reset_method for the function, so staff see
+	// it when approving. Only set for Intel Gaudi (nil for NVIDIA, whose
+	// payload stays as it was): a pointer to "" is sent as "reset_method":""
+	// and means the kernel knows no way to reset the module between tenants.
+	ResetMethod *string `json:"reset_method,omitempty"`
 }
 
 // CPUSpec is the host CPU summary.

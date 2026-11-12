@@ -23,6 +23,9 @@ type gaudiKernel struct {
 	Sysfs
 	mu  sync.Mutex
 	log []string
+	// refuseVfio makes a probe that would bind vfio-pci leave the function
+	// unbound (vfio-pci failing to take it).
+	refuseVfio bool
 }
 
 // newGaudiKernel makes one module per entry of onDriver, each at 0000:10+i:00.0
@@ -116,6 +119,13 @@ func (k *gaudiKernel) tick() {
 	drv := gaudiHabana
 	if ov, _ := os.ReadFile(filepath.Join(devs, a, "driver_override")); strings.TrimSpace(string(ov)) == Driver {
 		drv = Driver
+	}
+	k.mu.Lock()
+	refuse := drv == Driver && k.refuseVfio
+	k.mu.Unlock()
+	if refuse {
+		_ = os.WriteFile(probe, nil, 0o644)
+		return
 	}
 	k.note("bind %s %s", drv, a)
 	// The probe is consumed before the driver shows, so a caller that sees the
@@ -212,7 +222,8 @@ func TestGaudiBindUnbindsAnyDriver(t *testing.T) {
 }
 
 // A module whose unbind is refused (something holds it) is reported with its
-// driver, and is never bound.
+// driver, is never bound, and is left as found: still on habanalabs with the
+// override cleared (a later probe or boot must not send it to vfio-pci).
 func TestGaudiBindReportsBusyDriver(t *testing.T) {
 	k, addrs := newGaudiKernel(t, gaudiHabana)
 	if err := os.Remove(filepath.Join(k.Root, "sys/bus/pci/drivers", gaudiHabana, "unbind")); err != nil {
@@ -224,6 +235,78 @@ func TestGaudiBindReportsBusyDriver(t *testing.T) {
 	}
 	if k.Bound(addrs[0]) {
 		t.Fatal("bound despite the failed unbind")
+	}
+	if d := k.driver(addrs[0]); d != gaudiHabana {
+		t.Fatalf("driver after the failed Bind = %q, want %s still bound", d, gaudiHabana)
+	}
+	if ov := strings.TrimSpace(k.file(addrs[0], "driver_override")); ov != "" {
+		t.Fatalf("driver_override after the failed Bind = %q, want it empty", ov)
+	}
+}
+
+// vfio-pci not taking the module after the unbind: the override is cleared and
+// the module goes back to habanalabs.
+func TestGaudiBindRollsBackWhenVfioDoesNotTake(t *testing.T) {
+	k, addrs := newGaudiKernel(t, gaudiHabana)
+	k.mu.Lock()
+	k.refuseVfio = true
+	k.mu.Unlock()
+	err := k.Bind(addrs[0])
+	if err == nil || !strings.Contains(err.Error(), "after binding to vfio-pci") {
+		t.Fatalf("Bind: %v", err)
+	}
+	for range 500 {
+		if k.driver(addrs[0]) == gaudiHabana {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if d := k.driver(addrs[0]); d != gaudiHabana {
+		t.Fatalf("driver after the rollback = %q, want %s", d, gaudiHabana)
+	}
+	if ov := strings.TrimSpace(k.file(addrs[0], "driver_override")); ov != "" {
+		t.Fatalf("driver_override after the rollback = %q", ov)
+	}
+	want := []string{"unbind habanalabs " + addrs[0], "bind habanalabs " + addrs[0]}
+	if got := k.events(); !slices.Equal(got, want) {
+		t.Fatalf("kernel events = %v, want %v", got, want)
+	}
+}
+
+// Neither probe file works after the unbind: the error says so and the
+// override is cleared all the same (the module is not left sent to vfio-pci).
+func TestGaudiBindRollsBackWhenBindFails(t *testing.T) {
+	k, addrs := newGaudiKernel(t, gaudiHabana)
+	if err := os.Remove(filepath.Join(k.Root, "sys/bus/pci/drivers_probe")); err != nil {
+		t.Fatal(err)
+	}
+	err := k.Bind(addrs[0])
+	if err == nil || !strings.Contains(err.Error(), "bind to vfio-pci") {
+		t.Fatalf("Bind: %v", err)
+	}
+	if ov := strings.TrimSpace(k.file(addrs[0], "driver_override")); ov != "" {
+		t.Fatalf("driver_override after the failed bind = %q", ov)
+	}
+}
+
+// NVIDIA keeps what it did: a refused unbind leaves the override where it was
+// written (no rollback is added for it).
+func TestNvidiaBindFailureKeepsItsBehaviour(t *testing.T) {
+	k, addrs := newGaudiKernel(t, "nvidia")
+	if err := os.WriteFile(k.dev(addrs[0], "vendor"), []byte("0x10de\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(k.Root, "sys/bus/pci/drivers", "nvidia", "unbind")); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Bind(addrs[0]); err == nil || !strings.Contains(err.Error(), "unbind from nvidia") {
+		t.Fatalf("Bind: %v", err)
+	}
+	if ov := strings.TrimSpace(k.file(addrs[0], "driver_override")); ov != Driver {
+		t.Fatalf("an NVIDIA module's driver_override = %q: its failed Bind must behave as before", ov)
+	}
+	if d := k.driver(addrs[0]); d != "nvidia" {
+		t.Fatalf("driver = %q", d)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/runcrateai/runcrate-host/internal/api"
 	"github.com/runcrateai/runcrate-host/internal/config"
+	"github.com/runcrateai/runcrate-host/internal/hw"
 )
 
 // PendingUpdate is an update_agent command waiting for the new binary to
@@ -24,11 +25,21 @@ type Outgoing struct {
 	Result    api.CommandResult `json:"result"`
 }
 
+// DestroyedVM is what a destroy_vm remembers about the VM it removed, so a
+// retried destroy (the VM's record is gone by then) still says whose GPUs they were.
+type DestroyedVM struct {
+	Vendor hw.Vendor `json:"vendor"`
+	At     time.Time `json:"at"`
+}
+
 // State is what the agent must remember across restarts.
 type State struct {
-	Outbox        []Outgoing          `json:"outbox"`
-	Done          map[int64]time.Time `json:"done"`
-	PendingUpdate *PendingUpdate      `json:"pending_update,omitempty"`
+	Outbox []Outgoing          `json:"outbox"`
+	Done   map[int64]time.Time `json:"done"`
+	// Destroyed is the GPU vendor of VMs destroyed on a host with Gaudi
+	// modules, by VM id (kept a week, like Done).
+	Destroyed     map[string]DestroyedVM `json:"destroyed,omitempty"`
+	PendingUpdate *PendingUpdate         `json:"pending_update,omitempty"`
 
 	path string
 	mu   sync.Mutex
@@ -64,6 +75,11 @@ func (s *State) update(fn func(s *State)) error {
 	for id, at := range s.Done {
 		if time.Since(at) > 7*24*time.Hour {
 			delete(s.Done, id)
+		}
+	}
+	for id, d := range s.Destroyed {
+		if time.Since(d.At) > 7*24*time.Hour {
+			delete(s.Destroyed, id)
 		}
 	}
 	if s.path == "" {

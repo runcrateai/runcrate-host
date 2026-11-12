@@ -47,13 +47,29 @@ func write(path, val string) error {
 }
 
 // Bind puts one function on vfio-pci, with a bus reset first for the device
-// IDs that need one (preferBusReset). Idempotent.
+// IDs that need one (preferBusReset). Idempotent. For an Intel Gaudi (vendor
+// 1da3) a failure at any step puts the device back as it was found: the
+// override cleared and the original driver probed again, so a module whose
+// unbind was refused (busy) is not left with an override that sends it to
+// vfio-pci on the next probe or boot. NVIDIA keeps its behaviour: nothing is
+// rolled back.
 func (s Sysfs) Bind(addr string) error {
 	if !hw.ValidPCIAddress(addr) {
 		return fmt.Errorf("bad pci address %q", addr)
 	}
 	if s.driver(addr) == Driver {
 		return s.preferBusReset(addr)
+	}
+	orig := s.driver(addr)
+	// fail reports err and, for a Gaudi, restores the device as found.
+	fail := func(err error) error {
+		if v, _, perr := s.pciID(addr); perr != nil || v != gaudiVendor {
+			return err
+		}
+		if rerr := s.rollback(addr, orig); rerr != nil {
+			return errors.Join(err, fmt.Errorf("%s: rollback to %q: %w", addr, orig, rerr))
+		}
+		return err
 	}
 	if err := write(s.dev(addr, "driver_override"), Driver); err != nil {
 		return fmt.Errorf("%s: driver_override: %w", addr, err)
@@ -63,22 +79,53 @@ func (s Sysfs) Bind(addr string) error {
 		// something holds the GPU (nvidia-persistenced, a display server, a
 		// CUDA process, a Gaudi runtime).
 		if err := write(s.dev(addr, "driver/unbind"), addr); err != nil {
-			return fmt.Errorf("%s: unbind from %s (is something using the GPU?): %w", addr, cur, err)
+			return fail(fmt.Errorf("%s: unbind from %s (is something using the GPU?): %w", addr, cur, err))
 		}
 	}
 	if err := write(filepath.Join(s.Root, "sys/bus/pci/drivers_probe"), addr); err != nil {
 		// Older kernels: bind directly.
 		if err2 := write(filepath.Join(s.Root, "sys/bus/pci/drivers", Driver, "bind"), addr); err2 != nil {
-			return fmt.Errorf("%s: bind to vfio-pci: %w", addr, errors.Join(err, err2))
+			return fail(fmt.Errorf("%s: bind to vfio-pci: %w", addr, errors.Join(err, err2)))
 		}
 	}
 	for i := 0; i < 50; i++ {
 		if s.driver(addr) == Driver {
-			return s.preferBusReset(addr)
+			if err := s.preferBusReset(addr); err != nil {
+				return fail(err)
+			}
+			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("%s: still on %q after binding to vfio-pci", addr, s.driver(addr))
+	return fail(fmt.Errorf("%s: still on %q after binding to vfio-pci", addr, s.driver(addr)))
+}
+
+// gaudiVendor is the PCI vendor id of Intel Gaudi (Habana Labs), as pciID reads it.
+const gaudiVendor = 0x1da3
+
+// rollback undoes a failed Bind: clears the override, takes the function off
+// vfio-pci if it got there, and lets the kernel probe the original driver
+// again (drivers_probe, else a direct bind to it).
+func (s Sysfs) rollback(addr, orig string) error {
+	errs := []error{}
+	if err := write(s.dev(addr, "driver_override"), "\n"); err != nil {
+		errs = append(errs, fmt.Errorf("clear driver_override: %w", err))
+	}
+	if s.driver(addr) == Driver {
+		if err := write(s.dev(addr, "driver/unbind"), addr); err != nil {
+			errs = append(errs, fmt.Errorf("unbind from vfio-pci: %w", err))
+		}
+	}
+	if s.driver(addr) == "" {
+		if err := write(filepath.Join(s.Root, "sys/bus/pci/drivers_probe"), addr); err != nil {
+			if orig == "" {
+				errs = append(errs, fmt.Errorf("reprobe: %w", err))
+			} else if err2 := write(filepath.Join(s.Root, "sys/bus/pci/drivers", orig, "bind"), addr); err2 != nil {
+				errs = append(errs, fmt.Errorf("reprobe: %w", errors.Join(err, err2)))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // busResetIDs are the vendor:device IDs proven to need a secondary bus reset

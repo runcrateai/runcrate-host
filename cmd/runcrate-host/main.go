@@ -325,7 +325,7 @@ func cmdRegister(ctx context.Context, dir string, args []string) error {
 	}
 	models := map[string]bool{}
 	for _, g := range list {
-		req.Host.GPUs = append(req.Host.GPUs, api.RegisterGPU{Index: g.Index, ModelRaw: g.ModelRaw, VRAMGB: g.VRAMGB, UUID: g.UUID, PCIeAddress: g.Address})
+		req.Host.GPUs = append(req.Host.GPUs, registerGPU(g))
 		models[g.ModelRaw] = true
 	}
 	req.Host.Specs.GPUs.Count = len(list)
@@ -417,6 +417,18 @@ func currentUser() string {
 		return u.Username
 	}
 	return "uid " + fmt.Sprint(os.Geteuid())
+}
+
+// registerGPU is a GPU as the registration payload carries it. An Intel Gaudi
+// also reports its kernel reset_method ("" when it has none), for staff to see
+// when approving; an NVIDIA GPU's entry is exactly what it always was.
+func registerGPU(g hw.GPU) api.RegisterGPU {
+	r := api.RegisterGPU{Index: g.Index, ModelRaw: g.ModelRaw, VRAMGB: g.VRAMGB, UUID: g.UUID, PCIeAddress: g.Address}
+	if g.Vendor == hw.VendorHabana {
+		m := g.ResetMethod
+		r.ResetMethod = &m
+	}
+	return r
 }
 
 // registerRequestID is stable until registration succeeds, so a retry after

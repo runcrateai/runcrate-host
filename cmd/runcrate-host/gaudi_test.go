@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -248,6 +249,30 @@ func TestTopologyPartialVMOK(t *testing.T) {
 		h := &host{gpus: tc.gpus, nvswitches: tc.nvswitches, sys: hw.Sys{Root: t.TempDir()}}
 		if got := h.Topology().PartialVMOK; got != tc.want {
 			t.Errorf("%s: PartialVMOK = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Registration carries a Gaudi's reset_method (explicit "" when it has none);
+// an NVIDIA GPU's entry is byte-identical to what it was, whatever its reset
+// method is.
+func TestRegisterGPUCarriesResetMethodForGaudiOnly(t *testing.T) {
+	for name, tc := range map[string]struct {
+		gpu  hw.GPU
+		want string
+	}{
+		"nvidia": {hw.GPU{Index: 0, ModelRaw: "H100", VRAMGB: 80, UUID: "GPU-1", Address: "0000:41:00.0", Vendor: hw.VendorNvidia, ResetMethod: "flr"},
+			`{"index":0,"model_raw":"H100","vram_gb":80,"uuid":"GPU-1","pcie_address":"0000:41:00.0"}`},
+		"nvidia unrecorded vendor": {hw.GPU{Index: 1, ModelRaw: "H100", VRAMGB: 80, Address: "0000:42:00.0", ResetMethod: "flr bus"},
+			`{"index":1,"model_raw":"H100","vram_gb":80,"uuid":"","pcie_address":"0000:42:00.0"}`},
+		"gaudi": {hw.GPU{Index: 2, ModelRaw: "Intel Gaudi 3 OAM", VRAMGB: 128, Address: "0000:19:00.0", Vendor: hw.VendorHabana, ResetMethod: "flr bus"},
+			`{"index":2,"model_raw":"Intel Gaudi 3 OAM","vram_gb":128,"uuid":"","pcie_address":"0000:19:00.0","reset_method":"flr bus"}`},
+		"gaudi without a reset method": {hw.GPU{Index: 3, ModelRaw: "Intel Gaudi 3 OAM", VRAMGB: 128, Address: "0000:3b:00.0", Vendor: hw.VendorHabana},
+			`{"index":3,"model_raw":"Intel Gaudi 3 OAM","vram_gb":128,"uuid":"","pcie_address":"0000:3b:00.0","reset_method":""}`},
+	} {
+		raw, err := json.Marshal(registerGPU(tc.gpu))
+		if err != nil || string(raw) != tc.want {
+			t.Errorf("%s: payload %s (%v), want %s", name, raw, err, tc.want)
 		}
 	}
 }

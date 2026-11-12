@@ -2,6 +2,9 @@ package vm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -227,6 +230,49 @@ func TestGaudiScrubFailsTheHold(t *testing.T) {
 	}
 }
 
+// scrub_gpus false (Manager.Scrub off) must not leave a destroyed Gaudi VM's
+// modules free to rent: the hold is set at VM end. An NVIDIA GPU with the scrub
+// off is free again, as ever.
+func TestGaudiHoldDoesNotDependOnTheScrubSetting(t *testing.T) {
+	for name, tc := range map[string]struct {
+		vendor hw.Vendor
+		held   bool
+	}{
+		"gaudi":  {hw.VendorHabana, true},
+		"nvidia": {hw.VendorNvidia, false},
+	} {
+		f := newFixture(t)
+		f.m.GPUs[1].Vendor = tc.vendor
+		f.m.Scrub = false
+		f.prepTap(t, "vm-a")
+		f.prepTap(t, "vm-b")
+		ctx := context.Background()
+		if _, err := f.m.Create(ctx, spec("vm-a", 1)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if err := f.m.Destroy(ctx, "vm-a"); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		_, err := f.m.Create(ctx, spec("vm-b", 1))
+		if tc.held {
+			if err == nil || !strings.Contains(err.Error(), "held back after a failed memory scrub") {
+				t.Errorf("%s: a new VM on the destroyed module: %v", name, err)
+			}
+			if !f.m.HeldGPUs()[1] {
+				t.Errorf("%s: HeldGPUs = %v", name, f.m.HeldGPUs())
+			}
+			if _, serr := os.Stat(f.m.holdPath(1)); serr != nil {
+				t.Errorf("%s: the hold was not persisted: %v", name, serr)
+			}
+		} else if err != nil {
+			t.Errorf("%s: a new VM on a destroyed NVIDIA GPU with the scrub off: %v", name, err)
+		}
+		if started := f.host.startedIDs(); tc.held && len(started) != 1 {
+			t.Errorf("%s: a scrub VM started with the scrub off: %v", name, started)
+		}
+	}
+}
+
 // The script the Gaudi scrub VM really runs posts "wiped": false.
 func TestGaudiScrubScriptSaysNotWiped(t *testing.T) {
 	if !strings.Contains(GaudiScrubScript, `"wiped": False`) || strings.Contains(GaudiScrubScript, `"wiped": True`) {
@@ -303,6 +349,26 @@ func TestMixedHostWholeNodeRules(t *testing.T) {
 	for _, c := range f.host.calls {
 		if strings.HasPrefix(c, "systemd-run") && strings.Contains(c, "0000:e1:00.0") {
 			t.Fatalf("a Gaudi VM got the NVSwitches:\n%s", c)
+		}
+	}
+}
+
+// The NVIDIA scripts are pinned to fixed sha256 sums of the production text as
+// it was before the Gaudi work, not to a fresh call of the code under test
+// (scripts.go and isolation.go are unchanged since then).
+func TestNvidiaScriptsArePinned(t *testing.T) {
+	tg := IsolationTargets{HostIPs: []string{"192.0.2.10"}}
+	for name, tc := range map[string]struct{ got, want string }{
+		"BenchScript, no targets":    {BenchScript(IsolationTargets{}), "e47f14a5e3e027e7cf0f263b334f8ca30d6edabaa14409ba190d15b27b00269f"},
+		"BenchScript, a host target": {BenchScript(tg), "27503dcd3837d9b94630d90ef49ef0a92959e7013d762d541d151245bfce9718"},
+		"ScrubScript":                {ScrubScript, "a4b3a3fe548071aa157ecf945691e82cf90ed7c7ad615abdf543a38c7dd03cd6"},
+		// Without the isolation checks: new with the Gaudi work, pinned so it
+		// doesn't drift.
+		"benchmark without isolation": {ephemeralPrelude + benchGPUs, "b1796ae0882efd1c4921ef88310d0d89d3e7c6ee034f034c86944d268069f848"},
+	} {
+		sum := sha256.Sum256([]byte(tc.got))
+		if h := hex.EncodeToString(sum[:]); h != tc.want {
+			t.Errorf("%s changed: sha256 %s, want %s", name, h, tc.want)
 		}
 	}
 }

@@ -335,6 +335,41 @@ func (a *Agent) reportUpdate() {
 	})
 }
 
+// hostHasHabana reports whether any registered GPU on this host is an Intel
+// Gaudi module, from the GPU records.
+func (a *Agent) hostHasHabana() bool {
+	for _, g := range a.Host.GPUs() {
+		if a.VMs.GPUVendor(g.Index) == hw.VendorHabana {
+			return true
+		}
+	}
+	return false
+}
+
+// destroyVendor is the GPU vendor of the VM about to be destroyed: from its
+// record, else from what an earlier destroy of it remembered (a retry after
+// the record is gone). On a host with Gaudi modules a known vendor is saved in
+// the state first, so a destroy that is retried after a crash or a lost result
+// still reports whose GPUs they were. "" when unknown.
+func (a *Agent) destroyVendor(id string) hw.Vendor {
+	if v := a.VMs.VMVendor(id); v != "" {
+		if a.hostHasHabana() {
+			if err := a.State.update(func(s *State) {
+				if s.Destroyed == nil {
+					s.Destroyed = map[string]DestroyedVM{}
+				}
+				s.Destroyed[id] = DestroyedVM{Vendor: v, At: time.Now()}
+			}); err != nil {
+				a.Log.Error("save destroyed vm vendor", "vm", id, "err", err)
+			}
+		}
+		return v
+	}
+	var d DestroyedVM
+	a.State.view(func(s *State) { d = s.Destroyed[id] })
+	return d.Vendor
+}
+
 func (a *Agent) lock(key string) func() {
 	a.mu.Lock()
 	l, ok := a.locks[key]
@@ -392,13 +427,17 @@ func (a *Agent) handle(ctx context.Context, c api.Command) (any, error) {
 			return nil, fmt.Errorf("bad vm_id %q", p.VMID)
 		}
 		defer a.lock("vm:" + p.VMID)()
-		gaudi := a.VMs.VMVendor(p.VMID) == hw.VendorHabana
+		vendor := a.destroyVendor(p.VMID)
 		if err := a.VMs.Destroy(ctx, p.VMID); err != nil {
 			return nil, err
 		}
-		// "wiped" is what the host knows: the Gaudi scrub can't overwrite memory
-		// (see vm.GaudiScrubScript), so a Gaudi VM's GPUs are not wiped.
-		return map[string]any{"vm_id": p.VMID, "wiped": !gaudi}, nil
+		// "wiped" is what the host knows. True only for a VM positively
+		// identified as NVIDIA (or, on a host with no Gaudi module, one whose
+		// record is already gone: nothing there can be a Gaudi's). The Gaudi
+		// scrub can't overwrite memory (see vm.GaudiScrubScript), and a VM that
+		// can't be identified on a host with Gaudi modules might have been one.
+		wiped := vendor == hw.VendorNvidia || (vendor == "" && !a.hostHasHabana())
+		return map[string]any{"vm_id": p.VMID, "wiped": wiped}, nil
 
 	case api.KindReclaimNotice:
 		p, err := decode[api.ReclaimNotice](c.Payload)
@@ -599,15 +638,23 @@ func (a *Agent) benchmark(ctx context.Context, cmdID int64, p api.Benchmark) (an
 				}
 				if group.vendor == hw.VendorHabana {
 					// The VM only counted the accelerators: nothing was tested, so
-					// nothing passed (mem_ok and matmul_ok are false whatever the
-					// script said) and nothing failed: the hold state is left as
-					// it is, and the control plane decides (a Gaudi GPU is
-					// "pending manual" until the on-box tests are done).
+					// nothing passes (mem_ok and matmul_ok are false whatever the
+					// script said).
 					g.MemOK, g.MatmulOK, g.MemTestedGB, g.MatmulTFLOPSFP16 = false, false, 0, 0
-					g.VisibilityOnly, g.VisibleCount = true, len(vb.GPUs)
-					visibilityOnly++
-					req.GPUs = append(req.GPUs, g)
-					continue
+					if v != nil && gpuErr == "" && (vb.OK || a.DevGPUs != nil) && len(vb.GPUs) >= 1 {
+						// This device has a matched result from a successful run that
+						// saw at least one accelerator: visibility only. It is neither
+						// passed nor failed (the hold state is left as it is), and the
+						// control plane decides: a Gaudi GPU is "pending manual" until
+						// the on-box tests are done.
+						g.VisibilityOnly, g.VisibleCount = true, len(vb.GPUs)
+						visibilityOnly++
+						req.GPUs = append(req.GPUs, g)
+						continue
+					}
+					// A failed run, or no result for this device (fewer
+					// accelerators seen than assigned): a plain failure like any
+					// other GPU's, with no visibility_only and no visible_count.
 				}
 				switch {
 				case g.MemOK && g.MatmulOK:
